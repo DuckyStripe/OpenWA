@@ -209,6 +209,7 @@ describe('loadRemoteMedia — routes through the SSRF-pinned media fetch', () =>
           cancel: () => Promise.resolve(),
         };
       },
+      cancel: () => Promise.resolve(),
     },
   });
 
@@ -375,6 +376,31 @@ describe('WhatsAppWebJsAdapter.getChatHistory enrichment (parity with the live p
     expect(out[0].chatId).toBe('120363000@g.us');
     expect(out[0].kind).toBe('group');
     expect(out[0].isGroup).toBe(true);
+  });
+
+  it('skips the media download when the declared size exceeds a caller-tightened mediaMaxBytes', async () => {
+    // 12 MB passes the global 50 MiB default but not the seed's 10 MB store cap — proving the
+    // override (not the default) did the gating, and the blob is never downloaded.
+    const mediaMsg = {
+      id: { _serialized: 'M5' },
+      from: '621@c.us',
+      to: 'status@broadcast',
+      body: '',
+      type: 'image',
+      timestamp: 500,
+      fromMe: false,
+      hasMedia: true,
+      hasQuotedMsg: false,
+      _data: { size: 12 * 1024 * 1024, mimetype: 'image/jpeg' },
+      downloadMedia: jest.fn(),
+    };
+    const chat = { fetchMessages: jest.fn().mockResolvedValue([mediaMsg]) };
+    const client = { getChatById: jest.fn().mockResolvedValue(chat) };
+
+    const out = await readyAdapter(client).getChatHistory('status@broadcast', 50, true, 10 * 1024 * 1024);
+
+    expect(mediaMsg.downloadMedia).not.toHaveBeenCalled();
+    expect(out[0].media).toMatchObject({ omitted: true, sizeBytes: 12 * 1024 * 1024, mimetype: 'image/jpeg' });
   });
 });
 
@@ -1277,6 +1303,37 @@ describe('WhatsAppWebJsAdapter status methods', () => {
     ]);
     const result = await readyAdapter({ sendMessage: jest.fn(), getBroadcasts }).getContactStatuses();
     expect(result).toHaveLength(2); // only the populated broadcast maps
+  });
+
+  it('getContactStatuses downloads media for a media status via the shared inbound cap helper', async () => {
+    const downloadMedia = jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD' });
+    const mediaBroadcast = {
+      getContact: () => Promise.resolve({ id: { _serialized: '628222@c.us' }, name: 'Bob' }),
+      msgs: [
+        {
+          id: { _serialized: 'ST3' },
+          type: 'image',
+          body: 'seeded pic',
+          timestamp: 1700000030,
+          hasMedia: true,
+          _data: { mimetype: 'image/png', size: 3 },
+          downloadMedia,
+        },
+      ],
+    };
+    const getBroadcasts = jest.fn().mockResolvedValue([mediaBroadcast]);
+    const result = await readyAdapter({ sendMessage: jest.fn(), getBroadcasts }).getContactStatuses();
+    expect(downloadMedia).toHaveBeenCalled();
+    expect(result).toHaveLength(1);
+    expect(result[0].media).toEqual(expect.objectContaining({ mimetype: 'image/png', data: 'QUJD' }));
+  });
+
+  it('getContactStatuses does not attempt a media download for a text status (hasMedia false)', async () => {
+    // storyBroadcast msgs carry no hasMedia flag, matching a real text/chat story.
+    const getBroadcasts = jest.fn().mockResolvedValue([storyBroadcast]);
+    const result = await readyAdapter({ sendMessage: jest.fn(), getBroadcasts }).getContactStatuses();
+    expect(result[0].media).toBeUndefined();
+    expect(result[1].media).toBeUndefined();
   });
 });
 

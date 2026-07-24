@@ -4246,6 +4246,41 @@
         ]
       }
     },
+    "/api/sessions/{sessionId}/status/{statusId}/media": {
+      "get": {
+        "operationId": "StatusController_getStatusMedia",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "statusId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The status image/video bytes."
+          },
+          "404": {
+            "description": "No stored media (text status, omitted, or expired)."
+          }
+        },
+        "summary": "Stream a stored status media file",
+        "tags": [
+          "status"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/status/send-text": {
       "post": {
         "operationId": "StatusController_sendTextStatus",
@@ -5741,7 +5776,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API",
-    "version": "0.10.8",
+    "version": "0.10.10",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -6342,6 +6377,7 @@
                 "message.revoked",
                 "message.reaction",
                 "message.edited",
+                "status.received",
                 "session.status",
                 "session.qr",
                 "session.authenticated",
@@ -6487,6 +6523,7 @@
                 "message.revoked",
                 "message.reaction",
                 "message.edited",
+                "status.received",
                 "session.status",
                 "session.qr",
                 "session.authenticated",
@@ -7504,17 +7541,24 @@
           },
           "font": {
             "type": "number",
-            "description": "Font family index (0–5).",
+            "description": "Font family index from the WhatsApp status font enum: 0 (default), 1, 2, 6 (bold), 7, 8, 9, or 10. whatsapp-web.js honors only 0–7 and clamps anything above to the default.",
             "example": 0,
-            "minimum": 0,
-            "maximum": 5
+            "enum": [
+              0,
+              1,
+              2,
+              6,
+              7,
+              8,
+              9,
+              10
+            ]
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256). WhatsApp Status is not posted to a group — use @c.us or @lid individuals. Honored on the Baileys engine only: whatsapp-web.js ignores this allow-list and broadcasts to the account's status-privacy audience.",
+            "description": "Recipient JIDs (0–256). WhatsApp Status is not posted to a group — use @c.us or @lid individuals. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -7523,8 +7567,7 @@
           }
         },
         "required": [
-          "text",
-          "recipients"
+          "text"
         ]
       },
       "StatusMediaInput": {
@@ -7565,11 +7608,10 @@
             "maxLength": 1024
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256), @c.us or @lid. Honored on the Baileys engine only: whatsapp-web.js ignores this allow-list and broadcasts to the account's status-privacy audience.",
+            "description": "Recipient JIDs (0–256), @c.us or @lid. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -7578,8 +7620,7 @@
           }
         },
         "required": [
-          "image",
-          "recipients"
+          "image"
         ]
       },
       "SendVideoStatusDto": {
@@ -7600,11 +7641,10 @@
             "maxLength": 1024
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256), @c.us or @lid. Honored on the Baileys engine only: whatsapp-web.js ignores this allow-list and broadcasts to the account's status-privacy audience.",
+            "description": "Recipient JIDs (0–256), @c.us or @lid. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -7613,8 +7653,7 @@
           }
         },
         "required": [
-          "video",
-          "recipients"
+          "video"
         ]
       },
       "SendProductDto": {

@@ -106,6 +106,10 @@ export interface IncomingMessage {
   senderPhone?: string | null;
   /** Sender contact info, best-effort from the WhatsApp Web cache. Sync fields only (no network). */
   contact?: MessageContact;
+  /** Styling of a text status/story: background as `#RRGGBB`. Only set by engines that expose it. */
+  backgroundColor?: string;
+  /** Styling of a text status/story: the WhatsApp font index. Only set by engines that expose it. */
+  font?: number;
   media?: {
     mimetype: string;
     filename?: string;
@@ -255,6 +259,8 @@ export interface Status {
   type: 'text' | 'image' | 'video';
   caption?: string;
   mediaUrl?: string;
+  /** Downloaded media bytes for an image/video status, when the engine fetched them (see `capInboundMediaFor`). */
+  media?: IncomingMessage['media'];
   backgroundColor?: string;
   font?: number;
   timestamp: Date;
@@ -262,8 +268,12 @@ export interface Status {
 }
 
 export interface StatusPostOptions {
-  /** REQUIRED. Neutral JIDs (@c.us / @lid) permitted to see the status. Maps to Baileys statusJidList. */
-  recipients: string[];
+  /**
+   * Neutral JIDs (@c.us / @lid) permitted to see the status. Maps to Baileys statusJidList.
+   * REQUIRED on the Baileys engine (it rejects an absent/empty list with a 400); ignored by
+   * whatsapp-web.js, which broadcasts to the account's status-privacy audience.
+   */
+  recipients?: string[];
   /** Hex background colour (#RRGGBB). Text status only. */
   backgroundColor?: string;
   /** Font index. Text status only. */
@@ -611,7 +621,17 @@ export interface IWhatsAppEngine {
    * non-text or foreign messages at their own layer — the engine's error is surfaced as-is.
    */
   editMessage(chatId: string, messageId: string, body: string): Promise<MessageResult>;
-  getChatHistory(chatId: string, limit?: number, includeMedia?: boolean): Promise<IncomingMessage[]>;
+  /**
+   * Read a chat's recent messages, newest first. When `includeMedia` downloads blobs, an optional
+   * `mediaMaxBytes` tightens the declared-size pre-gate below the global MEDIA_DOWNLOAD_MAX_BYTES —
+   * the status seed uses it to skip downloads the store would discard as over-cap anyway.
+   */
+  getChatHistory(
+    chatId: string,
+    limit?: number,
+    includeMedia?: boolean,
+    mediaMaxBytes?: number,
+  ): Promise<IncomingMessage[]>;
 
   // Calls
   /**

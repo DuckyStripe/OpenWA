@@ -20,6 +20,7 @@ import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
+import { StatusStoreService } from '../status-store/status-store.service';
 import {
   IncomingMessage,
   EngineEventCallbacks,
@@ -62,6 +63,7 @@ describe('SessionService', () => {
   let hookManager: jest.Mocked<Partial<HookManager>>;
   let configService: jest.Mocked<Partial<ConfigService>>;
   let lidMappingStore: jest.Mocked<Partial<LidMappingStoreService>>;
+  let statusStore: jest.Mocked<Partial<StatusStoreService>>;
   let mockEngine: Record<string, jest.Mock>;
 
   beforeEach(async () => {
@@ -119,6 +121,9 @@ describe('SessionService', () => {
       sendChatState: jest.fn().mockResolvedValue(undefined),
       resolveContactPhone: jest.fn().mockResolvedValue('628111222333'),
       rejectCall: jest.fn().mockResolvedValue(undefined),
+      getContactStatuses: jest.fn().mockResolvedValue([]),
+      getChatHistory: jest.fn().mockResolvedValue([]),
+      getContactById: jest.fn().mockResolvedValue(null),
     };
 
     engineFactory = {
@@ -140,6 +145,7 @@ describe('SessionService', () => {
       emitGroupLeave: jest.fn(),
       emitGroupUpdate: jest.fn(),
       emitCallReceived: jest.fn(),
+      emitStatusReceived: jest.fn(),
       emitQRCode: jest.fn(),
     };
 
@@ -159,6 +165,11 @@ describe('SessionService', () => {
       remember: jest.fn().mockResolvedValue(undefined),
       getCached: jest.fn().mockReturnValue(undefined),
       lidsForPhone: jest.fn().mockReturnValue([]),
+    };
+
+    statusStore = {
+      // Default: nothing freshly inserted (callers only dispatch status.received on created=true).
+      ingest: jest.fn().mockResolvedValue({ row: {}, created: false }),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -182,6 +193,7 @@ describe('SessionService', () => {
         { provide: HookManager, useValue: hookManager },
         { provide: ConfigService, useValue: configService },
         { provide: LidMappingStoreService, useValue: lidMappingStore },
+        { provide: StatusStoreService, useValue: statusStore },
       ],
     }).compile();
 
@@ -1822,6 +1834,35 @@ describe('SessionService', () => {
       expect(row.metadata).toEqual({ media: marker });
     });
 
+    it('persists the group participant as author (the stable sender id attribution keys on)', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      // Pass the message through the hook chain untouched (the default mock replaces data with {}).
+      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'wa-grp-1',
+          from: '120363@g.us',
+          to: 'me@c.us',
+          chatId: '120363@g.us',
+          fromMe: false,
+          isGroup: true,
+          kind: 'group',
+          author: '628111@c.us',
+          contact: { id: '628111@c.us', pushName: 'Alice' },
+        }),
+      );
+      await flush();
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const row = (messageRepository.create as jest.Mock).mock.calls[0][0] as Partial<Message>;
+      expect(row.author).toBe('628111@c.us');
+      expect(row.from).toBe('120363@g.us');
+      expect(row.chatName).toBe('Alice');
+    });
+
     it('scopes the ack status UPDATE by sessionId, not just waMessageId', async () => {
       const callbacks = await startAndCaptureCallbacks();
       expect(typeof callbacks.onMessageAck).toBe('function');
@@ -2173,6 +2214,138 @@ describe('SessionService', () => {
       expect(dispatchedEvents('message.received')).toHaveLength(0);
     });
 
+    it('ingests an inbound status broadcast into the status store instead of dropping it', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (messageRepository.insert as jest.Mock).mockClear();
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(statusStore.ingest).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ waStatusId: 'st1', contactJid: '628111@c.us' }),
+      );
+      // Statuses never fall through to the messages table or the message.received webhook.
+      expect(messageRepository.insert).not.toHaveBeenCalled();
+      expect(dispatchedEvents('message.received')).toHaveLength(0);
+    });
+
+    it('dispatches status.received with the ingested row once ingest resolves with created=true', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (statusStore.ingest as jest.Mock).mockResolvedValueOnce({
+        created: true,
+        row: {
+          waStatusId: 'st1',
+          contactJid: '628111@c.us',
+          contactName: 'Alice',
+          type: 'text',
+          caption: 'hi',
+          mediaOmitted: false,
+          postedAt: 1000,
+          expiresAt: 1000 + 86400000,
+        },
+      });
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        'status.received',
+        expect.objectContaining({
+          statusId: 'st1',
+          contact: { id: '628111@c.us', name: 'Alice' },
+          type: 'text',
+          caption: 'hi',
+          hasMedia: false,
+          mediaOmitted: false,
+          postedAt: 1000,
+          expiresAt: 1000 + 86400000,
+        }),
+      );
+      // …and the same payload goes over the websocket so the dashboard refreshes live.
+      expect(eventsGateway.emitStatusReceived).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ statusId: 'st1', contact: { id: '628111@c.us', name: 'Alice' } }),
+      );
+    });
+
+    it('does not dispatch when the session is deleted mid-ingest', async () => {
+      // ingest() awaits (findOne + media write + save); a delete() completing in that window must
+      // stop the continuation before it webhooks/emits for a retired session — mirroring the
+      // message.received re-check above.
+      const callbacks = await startAndCaptureCallbacks();
+      const engines = (service as unknown as { engines: Map<string, unknown> }).engines;
+      (statusStore.ingest as jest.Mock).mockImplementationOnce(() => {
+        engines.delete('sess-uuid-1');
+        return Promise.resolve({ created: true, row: { waStatusId: 'st1', contactJid: '628111@c.us' } });
+      });
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(dispatchedEvents('status.received')).toHaveLength(0);
+      expect(eventsGateway.emitStatusReceived).not.toHaveBeenCalled();
+    });
+
+    it('does not dispatch status.received for a duplicate delivery (ingest resolves created=false)', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (statusStore.ingest as jest.Mock).mockResolvedValueOnce({
+        created: false,
+        row: { waStatusId: 'st1', contactJid: '628111@c.us' },
+      });
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(dispatchedEvents('status.received')).toHaveLength(0);
+      expect(eventsGateway.emitStatusReceived).not.toHaveBeenCalled();
+    });
+
     it('skips persist and dispatch for ephemeral messages when STORE_EPHEMERAL_MESSAGES=false', async () => {
       process.env.STORE_EPHEMERAL_MESSAGES = 'false';
       const callbacks = await startAndCaptureCallbacks();
@@ -2522,6 +2695,205 @@ describe('SessionService', () => {
       expect(auth[0][2]).toMatchObject({ sessionId: 'sess-uuid-1', phone: '628123', pushName: 'Alice' });
     });
 
+    it('seeds the status store from the status-broadcast chat history when the engine reports ready', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const nowSec = Math.floor(Date.now() / 1000);
+      mockEngine.getChatHistory.mockResolvedValue([
+        makeMessage({
+          id: 'st-a',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+          type: 'text',
+          body: 'hi',
+          timestamp: nowSec,
+          contact: { id: '628111@c.us', name: 'Alice', pushName: 'Ali' },
+        }),
+        makeMessage({
+          id: 'st-b',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628222@c.us',
+          kind: 'status',
+          type: 'image',
+          body: '',
+          timestamp: nowSec + 1,
+        }),
+        // Poster resolves to the shared pseudo-JID → buildIncomingStatus returns null → never ingested.
+        makeMessage({
+          id: 'st-self',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: 'status@broadcast',
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec + 2,
+        }),
+      ]);
+      // st-b's message carries no cached contact name; the seed resolves it via getContactById.
+      mockEngine.getContactById.mockImplementation((jid: string) =>
+        Promise.resolve(
+          jid === '628222@c.us'
+            ? {
+                id: '628222@c.us',
+                name: 'Bob',
+                pushName: 'Bobby',
+                number: '628222',
+                isMyContact: true,
+                isBlocked: false,
+              }
+            : null,
+        ),
+      );
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      // Reads the status-broadcast chat's own messages (with media), not the near-empty-at-ready
+      // getBroadcasts collection. Downloads are pre-gated at the store's 10 MB cap, not the looser
+      // global MEDIA_DOWNLOAD_MAX_BYTES — anything bigger would be discarded as over_cap on ingest.
+      expect(mockEngine.getChatHistory).toHaveBeenCalledWith('status@broadcast', 50, true, 10 * 1024 * 1024);
+      expect(mockEngine.getContactStatuses).not.toHaveBeenCalled();
+      // Two usable statuses ingested; the pseudo-JID poster is filtered out.
+      expect(statusStore.ingest).toHaveBeenCalledTimes(2);
+      expect(statusStore.ingest).toHaveBeenNthCalledWith(
+        1,
+        'sess-uuid-1',
+        expect.objectContaining({
+          waStatusId: 'st-a',
+          contactJid: '628111@c.us',
+          contactName: 'Alice',
+          contactPushName: 'Ali',
+          type: 'text',
+          caption: 'hi',
+          postedAt: nowSec * 1000,
+        }),
+      );
+      // st-b had no cached name, so the seed backfilled it from getContactById.
+      expect(statusStore.ingest).toHaveBeenNthCalledWith(
+        2,
+        'sess-uuid-1',
+        expect.objectContaining({
+          waStatusId: 'st-b',
+          contactJid: '628222@c.us',
+          type: 'image',
+          contactName: 'Bob',
+          contactPushName: 'Bobby',
+        }),
+      );
+      // The lookup runs only for the poster that lacked a name; st-a already had one.
+      expect(mockEngine.getContactById).toHaveBeenCalledWith('628222@c.us');
+      expect(mockEngine.getContactById).not.toHaveBeenCalledWith('628111@c.us');
+    });
+
+    it('seeds status media downloaded with the history so it renders like a live post', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const media = { mimetype: 'image/png', data: 'QUJD' };
+      mockEngine.getChatHistory.mockResolvedValue([
+        makeMessage({
+          id: 'st-c',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628333@c.us',
+          kind: 'status',
+          type: 'image',
+          body: '',
+          timestamp: Math.floor(Date.now() / 1000),
+          media,
+        }),
+      ]);
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(statusStore.ingest).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ waStatusId: 'st-c', media }),
+      );
+    });
+
+    it('skips the account’s own (fromMe) statuses and statuses older than 24h when seeding', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const nowSec = Math.floor(Date.now() / 1000);
+      mockEngine.getChatHistory.mockResolvedValue([
+        // Own active status echoed in the broadcast chat — mirrors the live path's fromMe drop.
+        makeMessage({
+          id: 'st-own',
+          from: 'me@c.us',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          fromMe: true,
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec,
+        }),
+        // 25 hours old — past the 24h TTL, gone from WhatsApp clients already.
+        makeMessage({
+          id: 'st-old',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec - 25 * 60 * 60,
+        }),
+      ]);
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(statusStore.ingest).not.toHaveBeenCalled();
+    });
+
+    it('keeps seeding the remaining statuses when one item’s ingest fails', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const nowSec = Math.floor(Date.now() / 1000);
+      const seedItem = (id: string, author: string) =>
+        makeMessage({
+          id,
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author,
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec,
+        });
+      mockEngine.getChatHistory.mockResolvedValue([
+        seedItem('st-fail', '628111@c.us'),
+        seedItem('st-ok', '628222@c.us'),
+      ]);
+      (statusStore.ingest as jest.Mock)
+        .mockRejectedValueOnce(new Error('database is locked'))
+        .mockResolvedValueOnce({ row: {}, created: true });
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(statusStore.ingest).toHaveBeenCalledTimes(2);
+      expect(statusStore.ingest).toHaveBeenNthCalledWith(
+        2,
+        'sess-uuid-1',
+        expect.objectContaining({ waStatusId: 'st-ok' }),
+      );
+    });
+
+    it('swallows a status-history failure on ready (e.g. Baileys has no status chat) without throwing', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      mockEngine.getChatHistory.mockRejectedValue(new Error('not supported'));
+
+      expect(() => callbacks.onReady!('628123', 'Alice')).not.toThrow();
+      await flush();
+
+      expect(statusStore.ingest).not.toHaveBeenCalled();
+    });
+
     it('dispatches session.disconnected with the reason when the engine disconnects', async () => {
       const callbacks = await startAndCaptureCallbacks();
       expect(typeof callbacks.onDisconnected).toBe('function');
@@ -2669,6 +3041,41 @@ describe('SessionService', () => {
         expect(qb.orIgnore).toHaveBeenCalled();
         expect(execute).toHaveBeenCalled();
         expect(messageRepository.save).not.toHaveBeenCalled(); // no longer the throwing path
+      });
+
+      it('persists author only for inbound history rows, never for the account’s own (fromMe) posts', async () => {
+        // The Baileys history sync includes the account's own group messages (with author = self);
+        // those must land with author NULL to keep the column's "null on outgoing" contract.
+        const callbacks = await startAndCaptureCallbacks();
+        const created: Array<Record<string, unknown>> = [];
+        (messageRepository.create as jest.Mock).mockImplementation((data: Record<string, unknown>) => {
+          created.push(data);
+          return { ...data };
+        });
+        (messageRepository.find as jest.Mock).mockResolvedValue([]); // nothing pre-seen
+
+        const histMsg = (over: Partial<IncomingMessage>): IncomingMessage => ({
+          id: 'h-x',
+          from: '120363@g.us',
+          to: 'me@c.us',
+          chatId: '120363@g.us',
+          body: 'g',
+          type: 'text',
+          timestamp: 1,
+          fromMe: false,
+          isGroup: true,
+          kind: 'group',
+          ...over,
+        });
+        callbacks.onHistoryMessages?.([
+          histMsg({ id: 'h-in', fromMe: false, author: '628111@c.us' }),
+          histMsg({ id: 'h-out', fromMe: true, author: '628999@c.us' }),
+        ]);
+        await flush();
+
+        const byId = new Map(created.map(r => [r.waMessageId as string, r]));
+        expect(byId.get('h-in')?.author).toBe('628111@c.us');
+        expect(byId.get('h-out')?.author).toBeUndefined();
       });
 
       it('synthesizes the omitted media marker for media-free history rows (no empty bubbles)', async () => {

@@ -28,6 +28,9 @@ import { userPart } from '../../engine/identity/wa-id';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
 import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
 import { resolveFeatureFlags } from '../../config/feature-flags';
+import { DEFAULT_MEDIA_MAX_BYTES, STATUS_TTL_MS, StatusStoreService } from '../status-store/status-store.service';
+import { buildIncomingStatus } from '../status-store/incoming-status';
+import type { StatusUpdate } from '../status-store/entities/status-update.entity';
 import {
   IWhatsAppEngine,
   EngineStatus,
@@ -60,6 +63,12 @@ import {
 // by-type stats filter skips the row. Sources that lack the payload (wwjs own-send echo, media-free
 // history sync) get the omitted marker synthesized at the persistence chokepoints.
 const MEDIA_MESSAGE_TYPES = new Set(['image', 'video', 'audio', 'voice', 'sticker', 'document']);
+
+// How many recent status-broadcast messages the connect-time seed pulls (each with its media).
+// ponytail: fixed ceiling — the most-recent 50 cover a normal account's 24h of stories; anything
+// posted after connect still lands live via onMessage. Make it configurable only if a flood account
+// proves 50 too few.
+const STATUS_SEED_LIMIT = 50;
 
 interface ReconnectState {
   attempts: number;
@@ -234,6 +243,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     private readonly eventsGateway: EventsGateway,
     private readonly webhookService: WebhookService,
     private readonly hookManager: HookManager,
+    private readonly statusStore: StatusStoreService,
     @Optional()
     private readonly configService?: ConfigService,
     // Shared lid<->phone table (global). Used to persist an inbound @lid sender's resolved phone so
@@ -646,6 +656,108 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
+   * Backfill currently-active statuses from the engine on connect, so the store has today's stories
+   * even for ones posted before this session came online (live posts land via onMessage). Best-effort:
+   * Baileys doesn't support this (throws EngineNotSupportedError) and any other engine error must not
+   * take down the ready path, so every failure is swallowed here. Ingest is idempotent on
+   * `(sessionId, waStatusId)`, so this can never double-count a status onMessage already ingested.
+   */
+  private async seedStatuses(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
+    try {
+      // Read the status-broadcast chat's own recent messages rather than getContactStatuses(): on
+      // whatsapp-web.js the latter reads the StatusV3 collection, which loads asynchronously and is
+      // near-empty right after ready, so a status posted before connect would silently never reach the
+      // store. Fetching the chat's messages (the same on-demand fetch the chat-history endpoint uses)
+      // reliably returns the currently-active statuses with downloadable media/video, and each maps
+      // through the very buildIncomingStatus the live onMessage path uses — so a seeded status is
+      // indistinguishable from one that arrives live. No status.received webhook is dispatched here:
+      // this is a backfill of posts that predate the connection, not a live arrival.
+      // Pre-gate media downloads at the store's own cap: a larger blob would be discarded as
+      // over_cap on ingest anyway, so downloading it is pure waste (heap + bandwidth).
+      const mediaMaxBytes =
+        this.configService?.get<number>('status.mediaMaxBytes', DEFAULT_MEDIA_MAX_BYTES) ?? DEFAULT_MEDIA_MAX_BYTES;
+      const messages = await engine.getChatHistory('status@broadcast', STATUS_SEED_LIMIT, true, mediaMaxBytes);
+      // getChatHistory maps a message's contact from the sync cache only, so status posters (usually
+      // @lid ids) come back nameless. Resolve each unique poster once via getContactById — the same
+      // lookup the contacts API uses, which maps the @lid to the real contact — so a seeded status
+      // carries the poster's name like a live one does. Cached per JID: one lookup per contact, not
+      // one per status.
+      const contactNames = new Map<string, { name?: string; pushName?: string }>();
+      const resolvePoster = async (jid: string): Promise<{ name?: string; pushName?: string }> => {
+        const cached = contactNames.get(jid);
+        if (cached) return cached;
+        let resolved: { name?: string; pushName?: string } = {};
+        try {
+          const contact = await engine.getContactById(jid);
+          if (contact) resolved = { name: contact.name, pushName: contact.pushName };
+        } catch {
+          // Best-effort: a failed lookup just leaves the status nameless.
+        }
+        contactNames.set(jid, resolved);
+        return resolved;
+      };
+      for (const msg of messages) {
+        try {
+          // Mirrors the live path's own-send drop: the broadcast chat's history also contains the
+          // account's OWN active statuses, which must not come back as if a contact had posted them.
+          if (msg.fromMe) continue;
+          // A status whose 24h already ran out is hidden by WhatsApp and would only live until the
+          // next purge sweep — don't backfill it (its media was downloaded by getChatHistory
+          // regardless; this just skips the row).
+          if (msg.timestamp * 1000 + STATUS_TTL_MS <= Date.now()) continue;
+          const status = buildIncomingStatus(msg);
+          if (!status) continue;
+          if (!status.contactName && !status.contactPushName) {
+            const poster = await resolvePoster(status.contactJid);
+            status.contactName = poster.name;
+            status.contactPushName = poster.pushName;
+          }
+          await this.statusStore.ingest(sessionId, status);
+        } catch (itemErr) {
+          // One bad item must not abort the whole backfill.
+          this.logger.warn('Status seed item skipped', {
+            sessionId,
+            error: itemErr instanceof Error ? itemErr.message : String(itemErr),
+          });
+        }
+      }
+    } catch (err) {
+      this.logger.debug('Status seed skipped', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Dispatches the opt-in `status.received` webhook once an inbound status row is ingested, and
+   * mirrors it over the websocket so the dashboard's statuses view refreshes live instead of
+   * waiting for a focus refetch. `WebhookService.dispatch` already filters delivery to webhooks
+   * whose `events` array includes `status.received`, so no extra gating is needed here. No media
+   * bytes are included in the payload — consumers fetch media via the status media endpoint.
+   */
+  private dispatchStatusReceived(sessionId: string, row: StatusUpdate): void {
+    const payload = {
+      sessionId,
+      statusId: row.waStatusId,
+      contact: {
+        id: row.contactJid,
+        ...(row.contactName ? { name: row.contactName } : {}),
+        ...(row.contactPushName ? { pushName: row.contactPushName } : {}),
+      },
+      type: row.type,
+      ...(row.caption ? { caption: row.caption } : {}),
+      hasMedia: Boolean(row.mediaPath) && !row.mediaOmitted,
+      mediaOmitted: row.mediaOmitted,
+      ...(row.omitReason ? { omitReason: row.omitReason } : {}),
+      postedAt: row.postedAt,
+      expiresAt: row.expiresAt,
+    };
+    void this.webhookService.dispatch(sessionId, 'status.received', payload);
+    this.eventsGateway.emitStatusReceived(sessionId, payload);
+  }
+
+  /**
    * Persist pre-connection history into the `messages` table for the chat view, without webhook/hook/ws
    * dispatch (it predates the live session). De-duplicated by `waMessageId` so re-syncs never duplicate.
    */
@@ -698,6 +810,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             sessionId: id,
             waMessageId: m.id,
             chatId: m.chatId,
+            // Group poster for inbound rows only — the account's own backfilled group messages must
+            // not carry author (the column's contract is "null on outgoing echoes").
+            author: m.fromMe ? undefined : m.author,
             from: m.from,
             to: m.to,
             body: m.body,
@@ -828,12 +943,41 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               error: err instanceof Error ? err.message : String(err),
             }),
           );
+
+        // Best-effort snapshot of the account's own contacts' currently-active statuses. Live status
+        // posts arrive through onMessage below; this just backfills what was already up before we
+        // connected. Not awaited — onReady must not block on it.
+        void this.seedStatuses(id, engine);
       },
       onMessage: (message): void => {
         if (!this.isLiveEngine(id, engine)) return;
-        // Status/Story posts arrive via the inbound path for some engines; don't persist or webhook them.
-        // Mirrors the isStatusBroadcast guard in onMessageCreate below.
+        // Status/Story posts arrive via the inbound path for some engines; ingest them into the
+        // status store instead of the message pipeline. Mirrors the isStatusBroadcast guard in
+        // onMessageCreate below: an own-send echo (fromMe) stays a plain drop — never ingested,
+        // never dispatched — so a status you posted never re-appears in your own webhooks/API as
+        // if a contact had posted it.
         if (message.isStatusBroadcast) {
+          if (message.fromMe) return;
+          const status = buildIncomingStatus(message);
+          if (status) {
+            void this.statusStore
+              .ingest(id, status)
+              // Dispatch only on a fresh insert: ingest also resolves with the pre-existing row
+              // for a duplicate delivery (or the winner's row after a lost insert race), and the
+              // webhook must fire once per status, not once per (re)delivery.
+              .then(({ row, created }) => {
+                // The ingest awaited; a stop()/delete() can retire this engine mid-flight — don't
+                // dispatch for a session that no longer exists (mirrors message.received's re-check).
+                if (!this.isLiveEngine(id, engine)) return;
+                if (created) this.dispatchStatusReceived(id, row);
+              })
+              .catch(err =>
+                this.logger.warn('Status ingest failed', {
+                  sessionId: id,
+                  error: err instanceof Error ? err.message : String(err),
+                }),
+              );
+          }
           return;
         }
         // Ephemeral/disappearing messages: skip persist + dispatch when the operator opted out.
@@ -918,6 +1062,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               waMessageId: incoming.id || undefined,
               chatId: incoming.chatId,
               chatName,
+              // Group poster (participant JID) — `from` is the group JID, so this is the stable
+              // sender identity the chat view keys attribution runs/colors on. Undefined for 1:1.
+              author: incoming.author,
               from: incoming.from,
               to: incoming.to,
               body: incoming.body,

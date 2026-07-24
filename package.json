@@ -1,6 +1,6 @@
 {
   "name": "openwa",
-  "version": "0.10.8",
+  "version": "0.10.10",
   "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API for WhatsApp",
   "author": "Yudhi Armyndharis & OpenWA Contributors",
   "private": true,
@@ -148,7 +148,8 @@
     },
     "moduleNameMapper": {
       "^@whiskeysockets/baileys$": "<rootDir>/../test/__mocks__/@whiskeysockets/baileys.ts",
-      "^@whiskeysockets/baileys/(.*)$": "<rootDir>/../test/__mocks__/@whiskeysockets/baileys.ts"
+      "^@whiskeysockets/baileys/(.*)$": "<rootDir>/../test/__mocks__/@whiskeysockets/baileys.ts",
+      "^archiver$": "<rootDir>/../test/__mocks__/archiver.ts"
     },
     "collectCoverageFrom": [
       "**/*.(t|j)s"

@@ -7,7 +7,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.10] - 2026-07-25
+
+### Added
+
+- **Text statuses keep their posted look.** The background color and font of a text status are now
+  captured on ingest (from the Baileys engine, which carries them on the wire) and rendered in the
+  dashboard viewer — colored bubble with white text and an approximated font family — instead of
+  every text story looking identical. The fields already existed on the API and SDK `StatusRecord`
+  shapes; whatsapp-web.js does not expose styling, so statuses from that engine render as before.
+
+- **New statuses now appear in the dashboard in real time.** A freshly ingested contact status is
+  broadcast over the websocket as `status.received` (same payload as the webhook), and the Status
+  tab refreshes immediately instead of waiting for a focus refetch — including while a contact's
+  viewer is already open.
+
+### Changed
+
+- **Status font selection now follows the real WhatsApp font enum.** `POST
+  /sessions/:id/status/send-text` accepts the font indices that actually exist on the wire — 0
+  (default), 1, 2, 6 (system bold), 7, 8, 9, 10 — instead of a 0–5 range that included
+  non-existent indices 3–5 and rejected the valid 6–10. The dashboard viewer renders the full
+  enum (bold/script/serif/mono slots approximated with generic families), and the compose
+  dropdown offers the same set.
+
 ### Fixed
+
+- **Backup restores no longer drop group sender attribution.** The data import now carries the
+  `author` column (the export already wrote it), so a backup→restore keeps each group message's
+  stable sender identity instead of collapsing attribution back to display names.
+
+- **Group messages now carry a stable sender identity, so same-named participants no longer blur
+  together.** Group messages persist the participant JID (new `author` column on `messages`) next
+  to the sender's display name, and the dashboard keys attribution runs and sender colors on that
+  identity instead of the name — two participants who share a pushName now get separate runs in
+  distinct colors instead of collapsing into one misattributed thread. Live, history-backfilled,
+  and websocket-delivered messages all carry it; legacy rows fall back to name-keying.
+
+- **Contacts with both a @lid and a phone identity now appear once in the status list.** Statuses
+  arriving under a contact's @lid are resolved to their phone at read time — including mappings
+  learned after the status arrived — so the same person no longer shows as two rows, and the
+  per-contact endpoint matches rows stored under either form.
+
+- **The status seed no longer downloads media the store would discard.** Media downloads during the
+  connect-time backfill are pre-gated at the store's own 10 MB cap instead of the looser global
+  media cap, so an over-cap blob is marked omitted without ever being fetched.
+
+- **Status store hardening.** A `@lid` query on the per-contact status endpoint now also matches
+  rows stored under the contact's phone (forward resolution, mirroring the reverse); lid
+  resolution is guarded to `@lid` inputs so a phone-shaped JID can never collide with a lid key;
+  media skipped by the seed's download pre-gate is recorded as `over_cap` rather than
+  `engine_omitted`; and a status ingest that finishes after its session was deleted no longer
+  dispatches `status.received` for the retired session.
+
+- **History backfill no longer marks the account's own posts.** Backfilled outgoing group messages
+  are stored with `author` NULL, keeping the column's "null on outgoing" contract the attribution
+  logic relies on.
+
+- **Dashboard follow-through.** A websocket reconnect now also refreshes the statuses list (a
+  story posted during the gap previously stayed invisible until a window-focus refetch); the
+  webhook editor offers `status.received` as an explicit subscription; and a styled status
+  bubble's timestamp inherits the bubble's text color instead of staying muted gray.
+
+## [0.10.9] - 2026-07-24
+
+### Added
+
+- **Statuses (stories) are now readable on both engines and retained for 24 hours.** Contact status
+  updates land in a dedicated 24-hour store as they arrive — so a status posted while the dashboard
+  was closed is still there — and `GET /sessions/:id/status` now serves them on the Baileys engine
+  too (previously whatsapp-web.js only). A new `GET /sessions/:id/status/:statusId/media` streams a
+  stored status image or video.
+
+- **New opt-in `status.received` webhook.** Subscribe a webhook to `status.received` to be notified
+  when a contact posts a status; the payload carries the contact, type, caption, and media flags (no
+  media blob — fetch it from the media endpoint). Off by default, though a webhook subscribed to `*`
+  (all events) receives it automatically.
+
+- **The dashboard Status tab is now functional.** It lists contacts with active statuses, opens a
+  read-only viewer for a contact's updates (image and video), and can post a text or image status,
+  with a recipient picker on the Baileys engine.
+
+- **Group chats now show who sent each message.** In a group conversation the dashboard labels each
+  incoming message with the sender's name — coloured per participant and shown once per consecutive
+  run — so a thread is no longer an anonymous wall of text. One-to-one chats are unchanged.
+
+### Changed
+
+- **Status `recipients` is now optional on the post-status endpoints.** `POST
+  /sessions/:id/status/send-text`, `send-image`, and `send-video` accept an omitted or empty
+  `recipients` list. The Baileys engine still requires it — it posts to exactly that allow-list, so
+  an absent/empty list now 400s there with a clear message — while whatsapp-web.js, which broadcasts
+  to the account's status-privacy audience and always ignored the field, no longer needs a
+  placeholder recipient to pass validation.
+
+### Fixed
+
+- **Contact statuses now actually ingest on the Baileys engine.** The message mapper only lifted the
+  sender's `participant` into `author` for group chats, so a status broadcast — whose chat is the
+  `status@broadcast` pseudo-JID, not a group — lost its poster, failed poster resolution, and was
+  silently dropped before reaching the 24h store. On a Baileys session the status list stayed empty
+  and `status.received` never fired. The poster is now mapped for status broadcasts too.
+
+- **`status.received` no longer fires twice for the same status.** The webhook now dispatches only
+  when ingest actually inserts a new row; a duplicate delivery (an engine re-emit after a
+  reconnect) or a lost insert race resolves the pre-existing row without re-notifying consumers.
+
+- **The status seed skips own and already-expired statuses, and survives a bad item.** The
+  connect-time backfill no longer ingests the account's own active statuses as if a contact had
+  posted them, skips statuses already past their 24-hour TTL, and one item's ingest failure no
+  longer aborts the rest of the backfill.
+
+- **Expired statuses disappear from the API immediately instead of at the next purge.** The status
+  list, per-contact list, and media endpoints now filter out rows past their 24-hour expiry rather
+  than serving them until the 15-minute purge sweep reaps them.
+
+- **Status media is served with a sanitized Content-Type.** The stored mimetype comes from
+  sender-controlled message metadata; anything outside `image/*` / `video/*` is now served as
+  `application/octet-stream` with `X-Content-Type-Options: nosniff`, so the media endpoint can't be
+  turned into active content on the API origin.
+
+- **The status viewer plays a contact's story in the right order.** Items were rendered newest-first
+  while the pane scrolls to the bottom on open, so the viewer opened on the oldest status and read
+  backwards; items are now oldest-first with the newest at the scroll position. Composing is also
+  blocked until the engine type has loaded, so a Baileys post can no longer go out without
+  recipients.
+
+- **A failed status ingest only resolves idempotently on a genuine unique-constraint violation.**
+  Previously any save error coinciding with an already-persisted row was swallowed into returning
+  that row; other persistence failures (e.g. a locked database) now propagate to the caller.
+
+- **The production Docker image no longer ships the TypeScript build cache.** The incremental
+  `tsbuildinfo` pinned inside `dist/` (needed so the dev server's `deleteOutDir` wipes it with the
+  output) is deleted at the end of the builder stage instead of being copied into every published
+  image.
+
+- **`npm run dev` no longer crashes on the second launch with `Cannot find module '.../dist/main'`.**
+  The TypeScript 6 upgrade moved the incremental build cache (`tsbuildinfo`) out of `dist/` to the
+  project root, where the dev server's `deleteOutDir` wipe could no longer remove it. On every start
+  after the first, the compiler trusted the stale cache, emitted no JavaScript at all, and the
+  freshly spawned `node dist/main` crashed with `MODULE_NOT_FOUND` (#891). The cache is pinned back
+  inside `dist/` so it is wiped together with the build output, restoring a full emit on every start.
+  Thanks @Magnarks.
 
 - **Outbound `withSafeFetch` no longer crashes the process on unread webhook response bodies.**
   Status-only callers (queued webhook delivery, webhook test, deprecated direct delivery) left the
@@ -16,6 +157,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no listener, becoming a fatal `uncaughtException` that took every WhatsApp session offline (#887).
   `withSafeFetch` now cancels unread bodies before tearing down the connection; callers that already
   stream the body (media / plugin downloads) are unchanged.
+
+- **Expired status media now 404s instead of 500ing when the purge races a stream.** A `GET
+  /sessions/:id/status/:statusId/media` landing in the sub-second window where the 24h purge deletes
+  the backing file mid-request previously surfaced a generic 500; a missing file now maps to the
+  same 404 as an unknown or omitted status.
+
+- **A lost status-ingest race no longer leaks an orphaned media file.** When two concurrent ingests
+  of the same status (e.g. the connect-time seed racing a live event) both wrote a media file before
+  the unique constraint settled the winner, the loser's file was referenced by no row and could
+  never be purged. The loser now deletes its own file before returning the winner's row.
+
+- **Status tab polish.** The retired Phase-1 aggregate status row no longer stacks above the
+  per-contact list; the statuses query waits for the Status tab instead of firing on every session
+  select; and picking an image file then immediately switching to a URL no longer lets the
+  late-arriving file bytes override the URL.
+
+- **Status tab: clearer errors, a fresher viewer, and picker fixes.** A failed statuses fetch now
+  shows an explicit error instead of looking like "no active statuses". The open status viewer
+  stays in sync when statuses refetch — newly arrived items appear without re-opening the contact,
+  and a contact whose statuses have all expired closes cleanly. The compose recipient search now
+  matches name, pushName, number, or JID, and selection is capped at 256 like the backend instead
+  of failing on submit. Contacts known only by their pushName now show it in the list and viewer
+  instead of a raw JID. The locales drop two dead keys, and Arabic, Hebrew, and Telugu get proper
+  plural forms for the status item count.
 
 ## [0.10.8] - 2026-07-23
 
