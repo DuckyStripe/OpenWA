@@ -58,9 +58,13 @@ import { useChannelMessages } from '../hooks/useChannelMessages';
 import { useContactStatuses } from '../hooks/useContactStatuses';
 import { useChatScrollPosition } from '../hooks/useChatScrollPosition';
 import { useCurrentEngineQuery } from '../hooks/queries';
+import { createTrailingCoalescer } from '../utils/trailingCoalescer';
 import MessageBody from '../components/chats/MessageBody';
 import MediaLightbox, { type LightboxItem } from '../components/chats/MediaLightbox';
 import './Chats.css';
+
+// Quiet window for coalescing mark-as-read RPCs (see markReadCoalescer below).
+const MARK_READ_DEBOUNCE_MS = 750;
 
 type MessageMedia = { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
 
@@ -424,6 +428,19 @@ export function Chats() {
   } | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState<boolean>(false);
+  // Monotonic token invalidating an in-flight attachment FileReader: picking a second file (or
+  // removing the attachment) before `onload` fires must win over the late-arriving bytes —
+  // otherwise the slower read overwrites the newer pick. Same pattern as composeImageReadSeq.
+  const attachmentReadSeq = useRef(0);
+
+  // Unmounting the page with a read still in flight: invalidate both readers so their late
+  // onload handlers drop the bytes instead of setting state on a dead component.
+  useEffect(() => {
+    return () => {
+      attachmentReadSeq.current += 1;
+      composeImageReadSeq.current += 1;
+    };
+  }, []);
 
   // References
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -572,13 +589,31 @@ export function Chats() {
     return () => URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
 
+  // Coalesce mark-as-read RPCs per chat: every incoming message in the visible chat raises a
+  // read event, and a per-event POST sprays the gateway into 429s. One trailing call per chat
+  // after a quiet window carries the same effect.
+  const markReadCoalescer = useMemo(
+    () =>
+      createTrailingCoalescer<string>(chatId => {
+        void sessionApi.markChatRead(selectedSessionId, chatId).catch(err => {
+          showWarningToast(t('chats.errors.markRead'), err instanceof Error ? err.message : undefined);
+        });
+      }, MARK_READ_DEBOUNCE_MS),
+    [selectedSessionId, t, showWarningToast],
+  );
+
+  // Flush pending trailing calls on unmount / session switch: the mark-as-read POST is
+  // fire-and-forget (a failure only raises a warning toast), so firing on the way out is safe —
+  // and dropping the pending call would leave the last messages of a quickly-exited chat unread.
+  // The flush closure still references the PREVIOUS session on a session switch, which is exactly
+  // where those queued reads belong.
+  useEffect(() => () => markReadCoalescer.flush(), [markReadCoalescer]);
+
   const markChatRead = useCallback(
     (chatId: string) => {
-      void sessionApi.markChatRead(selectedSessionId, chatId).catch(err => {
-        showWarningToast(t('chats.errors.markRead'), err instanceof Error ? err.message : undefined);
-      });
+      markReadCoalescer.call(chatId);
     },
-    [selectedSessionId, t, showWarningToast],
+    [markReadCoalescer],
   );
 
   // 3. WebSocket integration for real-time messages
@@ -998,8 +1033,11 @@ export function Chats() {
       setPreviewUrl(null);
     }
 
+    const myRead = ++attachmentReadSeq.current;
     const reader = new FileReader();
     reader.onload = event => {
+      // A newer pick, a removal, or an unmount since the read started supersedes these bytes.
+      if (attachmentReadSeq.current !== myRead) return;
       const dataUrl = event.target?.result as string;
       const base64Data = dataUrl.split(',')[1];
       setAttachment({ file, base64: base64Data, mimetype: file.type, filename: file.name });
@@ -1008,6 +1046,7 @@ export function Chats() {
   };
 
   const handleRemoveAttachment = () => {
+    attachmentReadSeq.current += 1; // an in-flight read must not resurrect the removed attachment
     setAttachment(null);
     setPreviewUrl(null);
     if (fileInputRef.current) fileInputRef.current.value = '';

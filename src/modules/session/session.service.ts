@@ -348,23 +348,27 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     this.engines.clear();
   }
 
-  /** Destroy one engine, isolating + time-bounding failures so shutdown can't be stalled or aborted. */
-  private async destroyEngineSafely(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
+  /** Destroy one engine, isolating + time-bounding failures so shutdown can't be stalled or aborted.
+   *  Resolves to whether the destroy actually completed (see teardownEngineSafely). */
+  private async destroyEngineSafely(sessionId: string, engine: IWhatsAppEngine): Promise<boolean> {
     this.logger.log(`Destroying engine for session ${sessionId}`, { sessionId, action: 'shutdown' });
-    await this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy');
+    return this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy');
   }
 
   /**
    * Run an engine teardown (destroy/disconnect), isolating + time-bounding failures so a stuck
    * Chromium/socket can neither hang nor abort the caller. Always resolves — the caller is then free
    * to reconcile the engines Map and proceed with DB cleanup regardless of teardown outcome.
+   * Resolves to whether the teardown actually completed: `false` means it threw or hit the 10s
+   * deadline, so the underlying Chromium/socket may still be alive (a caller with an operator-facing
+   * outcome, like stopOrphanEngines, must surface that instead of reporting a clean stop).
    */
   private async teardownEngineSafely(
     sessionId: string,
     engine: IWhatsAppEngine,
     teardown: (e: IWhatsAppEngine) => Promise<void>,
     label: 'destroy' | 'disconnect' | 'force-destroy',
-  ): Promise<void> {
+  ): Promise<boolean> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
@@ -373,11 +377,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           timer = setTimeout(() => reject(new Error(`engine.${label}() timed out`)), 10_000);
         }),
       ]);
+      return true;
     } catch (err) {
       this.logger.error(`Failed to ${label} engine for session ${sessionId}`, String(err), {
         sessionId,
         action: `engine_${label}_failed`,
       });
+      return false;
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -535,10 +541,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         action: 'delete',
       });
 
-      // Purge the engine's persistent on-disk auth/store dir. It's keyed by session NAME and lives
-      // independently of the (now torn-down, and on delete often never-loaded) engine instance, so the
-      // teardown above doesn't touch it. Without this, recreating a session under the same name reloads
-      // a stale store. Best-effort inside the factory — never fails an otherwise-successful delete.
+      // Purge the persistent on-disk auth/store dirs — BOTH engine shapes (see EngineFactory), since
+      // an engine switch may have left a live link for the other engine behind. They're keyed by
+      // session NAME and live independently of the (now torn-down, and on delete often never-loaded)
+      // engine instance, so the teardown above doesn't touch them. Without this, recreating a session
+      // under the same name reloads a stale store. Best-effort inside the factory — never fails an
+      // otherwise-successful delete.
       await this.engineFactory.purgeSessionData(session.name);
     } finally {
       // Always clear the teardown mark so a later recreate/start with this id isn't suppressed.
@@ -551,31 +559,38 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   async start(id: string): Promise<Session> {
-    const session = await this.findOne(id);
-
-    // Reserve the slot SYNCHRONOUSLY (same tick as the has() check) so two near-simultaneous
-    // start() calls can't both pass the check and orphan an engine — the has() -> engines.set()
-    // window spans the awaited hook below. The second caller is rejected; the finally clears the
-    // reservation on success AND failure so a failed start never wedges at "already starting".
-    if (this.engines.has(id)) {
-      throw new BadRequestException('Session is already started');
-    }
+    // Reserve the slot SYNCHRONOUSLY at entry — before even the findOne await. Two near-simultaneous
+    // start() calls must not both pass the check and orphan an engine (the has() -> engines.set()
+    // window spans the awaited hook below), and the infra import pre-flight (getActiveSessionIds)
+    // must see an in-flight start during the findOne round-trip too: registered only after findOne,
+    // a start would be invisible in that window and a stopOrphans import could DELETE the session
+    // row while an engine for it is being created. The finally clears the reservation on success
+    // AND failure so a failed start never wedges at "already starting".
     if (this.initializingSessions.has(id)) {
       throw new BadRequestException('Session is already starting');
-    }
-    const maxConcurrentSessions = resolveMaxConcurrentSessions(this.configService);
-    if (maxConcurrentSessions !== null) {
-      // Count each session once. A session mid-initialization is transiently in BOTH `engines` (set at
-      // the start of initializeEngine) and `initializingSessions` (until start()'s finally), so summing
-      // the two sizes would double-count it and falsely reject new starts at ~half the configured cap.
-      const activeCount = new Set<string>([...this.engines.keys(), ...this.initializingSessions]).size;
-      if (activeCount >= maxConcurrentSessions) {
-        throw new BadRequestException(`Maximum concurrent sessions reached (${maxConcurrentSessions})`);
-      }
     }
     this.initializingSessions.add(id);
 
     try {
+      const session = await this.findOne(id);
+
+      if (this.engines.has(id)) {
+        throw new BadRequestException('Session is already started');
+      }
+      const maxConcurrentSessions = resolveMaxConcurrentSessions(this.configService);
+      if (maxConcurrentSessions !== null) {
+        // Count each OTHER session once. A session mid-initialization is transiently in BOTH
+        // `engines` (set at the start of initializeEngine) and `initializingSessions` (until
+        // start()'s finally), so summing the two sizes would double-count it; and `id` itself is
+        // already reserved in `initializingSessions` (added at entry), so it must not count
+        // against the cap it is being checked against.
+        const activeIds = new Set<string>([...this.engines.keys(), ...this.initializingSessions]);
+        activeIds.delete(id);
+        if (activeIds.size >= maxConcurrentSessions) {
+          throw new BadRequestException(`Maximum concurrent sessions reached (${maxConcurrentSessions})`);
+        }
+      }
+
       // A fresh start intentionally (re-)creates the engine — clear any stale stop/delete mark.
       this.stoppingSessions.delete(id);
 
@@ -635,6 +650,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
           if (this.isLiveEngine(id, resurrected)) this.engines.delete(id);
         }
+        // A delete() that raced this start purged the on-disk auth dirs BEFORE this init re-created
+        // them — purge again so the window leaves no credential residue behind (no-op for a stop()).
+        await this.purgeAuthDirsIfDeleted(id, session.name);
       }
       return this.findOne(id);
     } finally {
@@ -1919,6 +1937,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           : `Reconnection failed after ${state.attempts} attempts — restart the session.`,
       );
       void this.updateStatus(id, SessionStatus.FAILED);
+      // Terminal path — evict the dead engine so it neither holds a concurrency slot nor makes a
+      // subsequent start() reject the session as "already started". This mirrors onError's terminal
+      // path (the same rationale: leaving the engine in the map wedges the session). The engine may
+      // already be gone in the executeReconnect-catch path (it evicts the half-built engine before
+      // scheduling a reconnect), so guard on its presence — evictAndForceDestroy takes a non-null engine.
+      const deadEngine = this.engines.get(id);
+      if (deadEngine) {
+        this.evictAndForceDestroy(id, deadEngine);
+      }
       return;
     }
 
@@ -1986,6 +2013,32 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return (await this.sessionRepository.findOne({ where: { id } })) == null;
   }
 
+  /**
+   * Re-purge a retired session's on-disk auth dirs when its row was deleted while a slow
+   * engine.initialize() was still in flight. A start()/(re)connect that lands between delete()'s
+   * engine eviction and its row removal initializes a fresh engine that RE-CREATES the auth dir
+   * purgeSessionData just emptied (both engines mkdir at init); the post-init guard tears the engine
+   * down, but engine teardown never touches the on-disk dirs, so without this second purge the race
+   * leaves live WhatsApp credentials behind — and a later same-name recreate would silently re-link
+   * them. Gated two ways so ONLY the delete race purges: a stop() retirement still has its row (its
+   * credentials must survive), and a row re-created under the SAME name now owns those dirs, so
+   * purging would wipe the fresh session's link. Best-effort: a failure is logged, never thrown —
+   * the retirement path must still surface the deleted session as NotFound.
+   */
+  private async purgeAuthDirsIfDeleted(id: string, name: string): Promise<void> {
+    try {
+      if ((await this.sessionRepository.findOne({ where: { id } })) != null) return;
+      if ((await this.sessionRepository.findOne({ where: { name } })) != null) return;
+      await this.engineFactory.purgeSessionData(name);
+    } catch (error) {
+      this.logger.warn('Failed to re-purge session auth dirs after a start/delete race', {
+        sessionId: id,
+        action: 'engine_repurge_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private async executeReconnect(id: string, session: Session, state: ReconnectState): Promise<void> {
     // The session may have been stopped/deleted before this fired — don't resurrect it.
     if (this.stoppingSessions.has(id)) {
@@ -2024,6 +2077,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
           if (this.isLiveEngine(id, resurrected)) this.engines.delete(id);
         }
+        // Same start/delete window as start()'s post-init guard: this re-init re-created auth dirs
+        // delete() had already purged — purge again so no credentials outlive the row.
+        await this.purgeAuthDirsIfDeleted(id, session.name);
         return;
       }
     } catch (error: unknown) {
@@ -2345,6 +2401,82 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   isActive(id: string): boolean {
     return this.engines.has(id);
+  }
+
+  /**
+   * Ids of every session with a live engine — including ones mid-initialization (their engine is not
+   * in `engines` yet but will register when start() completes). The infra import pre-flight uses this
+   * to refuse a full-replace restore that would orphan a running engine.
+   */
+  getActiveSessionIds(): string[] {
+    return [...new Set([...this.engines.keys(), ...this.initializingSessions])];
+  }
+
+  /**
+   * Stop the engines for the given session ids WITHOUT touching the sessions DB row (the caller,
+   * the infra import path, is about to DELETE that row as part of a full replace). This is the one
+   * stop path that bypasses findOne()/stop()/delete() — every other path keys through the row, so an
+   * engine orphaned by a restore was previously unstoppable until process restart.
+   *
+   * Each id is handled in isolation and time-bounded: a stuck Chromium/socket on one orphan can
+   * neither stall nor abort the others, and the whole call is bounded by teardownEngineSafely's
+   * per-engine 10s deadline. The mark + reconnect-cancel happen first so an in-flight reconnect
+   * cannot resurrect the id while teardown runs. Engines that are mid-initialization (no entry in
+   * `engines` yet) are marked but cannot be torn down here — their start() will see the stop mark
+   * via its existing guard and self-abort; the caller learns about them in `notRunning`.
+   *
+   * Always resolves. Best-effort: a `failed` entry means teardown threw or timed out, and the engine
+   * is removed from the Map regardless so it stops holding a concurrency slot.
+   */
+  async stopOrphanEngines(
+    sessionIds: string[],
+  ): Promise<{ stopped: string[]; notRunning: string[]; failed: string[] }> {
+    const stopped: string[] = [];
+    const notRunning: string[] = [];
+    const failed: string[] = [];
+
+    if (sessionIds.length === 0) return { stopped, notRunning, failed };
+
+    await Promise.allSettled(
+      sessionIds.map(async id => {
+        // Mark + cancel BEFORE teardown so a late reconnect cannot resurrect the id mid-teardown.
+        this.stoppingSessions.add(id);
+        this.cancelReconnect(id);
+
+        const engine = this.engines.get(id);
+        if (!engine) {
+          // Either never started, or still inside initializeEngine (no Map entry yet). The stop mark
+          // above is what aborts the initializing case via start()'s existing guard.
+          notRunning.push(id);
+          return;
+        }
+        try {
+          const tornDown = await this.destroyEngineSafely(id, engine);
+          // The engine leaves the Map regardless of teardown outcome so it stops holding a
+          // concurrency slot — but only a completed teardown counts as `stopped`. A throw/timeout
+          // means the Chromium/socket may still be alive and writing, so the id lands in `failed`
+          // and the caller (the infra import) can flag restartRequired instead of reporting a
+          // clean stop for a wedged engine.
+          if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+          if (tornDown) {
+            stopped.push(id);
+          } else {
+            failed.push(id);
+          }
+        } catch (err) {
+          // destroyEngineSafely never throws today (it isolates via teardownEngineSafely), but defend
+          // against a future change so a single orphan cannot abort the batch.
+          this.logger.error(`Failed to stop orphan engine for session ${id}`, String(err), {
+            sessionId: id,
+            action: 'stop_orphan_failed',
+          });
+          if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+          failed.push(id);
+        }
+      }),
+    );
+
+    return { stopped, notRunning, failed };
   }
 
   private delay(ms: number): Promise<void> {

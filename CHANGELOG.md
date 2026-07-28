@@ -7,6 +7,660 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Native Windows and npm 12 source installs no longer fail during dependency setup.** The
+  whatsapp-web.js backport now normalizes reject-file paths before comparing them, so Windows'
+  `src\structures\Contact.js.rej` is recognized as the same expected, harmless reject as the POSIX
+  path and is cleaned up after verification. The lockfile also resolves `libsignal@6.0.0` from its
+  npm registry tarball (published from the same commit previously fetched over Git SSH), avoiding
+  npm 12's `EALLOWGIT` default without weakening its project security policy.
+
+## [0.11.1] - 2026-07-28
+
+### Added
+
+- **The Baileys engine now honors the per-session egress proxy** (#859). `proxyUrl` — http, https,
+  socks4 or socks5, credentialed form included — is applied through a Node-layer agent on both the
+  WhatsApp WebSocket and media up/downloads (`https-proxy-agent` / `socks-proxy-agent`, now direct
+  dependencies). Previously the engine warned `baileys_proxy_unsupported` and connected direct,
+  silently exposing the host's real egress IP for exactly the deployments that configured a proxy.
+  An unusable proxy value now fails the session start instead of falling back to a direct
+  connection. Credentials authenticate on the socket itself, so the Chromium first-CONNECT 407
+  limitation that can bite the wwjs engine's proxy-auth path does not apply to this engine.
+
+- **The OpenAPI spec now declares a templated default server.** `servers` was empty; it now carries
+  `http://{host}:{port}` with `localhost`/`2785` defaults, so Swagger UI's "Try it" works out of the
+  box and stays usable on real deployments via the host/port variables, and static consumers of the
+  published `openapi.json` get a concrete base URL to display.
+
+### Fixed
+
+- **The published OpenAPI spec no longer advertises a `200` the catalog endpoints never return.**
+  `GET /sessions/{id}/catalog`, `/catalog/products` and `/catalog/products/{productId}` each declared
+  a `200` response described as "always null on whatsapp-web.js", from a time when that engine
+  returned an empty result instead of refusing. Both adapters now throw, so every call answers `501`,
+  and a generated client built against the old snapshot modelled a success case that cannot occur.
+  The stale declarations are removed, the remaining `501` description no longer names only Baileys,
+  and `openapi.json` is regenerated.
+
+- **The documentation set now matches the shipped implementation.** Every numbered document was
+  checked claim by claim against source, and the corrections concentrate where following the docs
+  could fail silently. Session auth was documented at `./data/.wwebjs_auth` when it lives under
+  `SESSION_DATA_PATH` (default `./data/sessions`), so every backup, server-transfer and rollback
+  procedure copied a directory that does not exist and still reported success; compose commands
+  addressed a service named `openwa` where the shipped file defines `openwa-api`; the upgrade runbook
+  used `docker compose pull` against a compose file that builds from source; health checks omitted
+  the global `api` prefix; and several referenced files and scripts were never part of the repository.
+  Documented settings that the configuration layer does not read (`WA_RECONNECT_INTERVAL`,
+  `STORAGE_S3_*`, `CACHE_TYPE`, `API_PREFIX` and others) are replaced by the real names. Endpoints
+  and tooling that do not exist — per-session export/import, a 1.x upgrade path, an MCP tool name —
+  are removed, the catalog endpoints are marked as answering 501 on both engines, and the glossary no
+  longer defines a message queue, message scheduling or a Redis-backed dead-letter queue, none of
+  which the gateway has. Two risk-register rows that claimed send-rate safeguards now describe the
+  controls that ship. Structurally, `docs/23-plugin-sandboxing.md` becomes `docs/30`, resolving a
+  duplicate prefix; the engine capability matrix joins the sequence as `docs/29`; a language-forked
+  second copy of the Docker guide is removed; and the index lists all thirty documents. Separately,
+  the community guidelines and the incident-response template both published a security contact
+  address that does not exist, so a vulnerability report sent by either route reached no maintainer;
+  both now carry the channels `SECURITY.md` defines, GitHub Security Advisories first.
+
+- **A source install without the GNU `patch` binary no longer silently ships an unpatched
+  whatsapp-web.js.** OpenWA backports the fix for the WhatsApp Web 2.3000.x message-id rename during
+  `npm install`; when the `patch` binary was missing — the default on Windows outside Git Bash — the
+  install printed one warning, exited successfully, and left whatsapp-web.js broken. The failure then
+  surfaced only in production, as sends returning `the engine returned no message` despite delivering,
+  and chat, media and typing operations throwing the minified `r: r`. The backport now falls back to
+  `git apply`, which every source install has by definition and which produces a byte-identical tree.
+  With neither applier present the install still degrades rather than failing, so a Baileys-only setup
+  is unaffected — but the whatsapp-web.js engine now logs an explicit, actionable error at session
+  start instead of failing opaquely later. Prerequisites and a troubleshooting entry are documented.
+
+- **The release runbook in `docs/15` now describes the process the repository actually uses.** §15.7
+  documented a release-branch-and-PR flow with a generic pre-release checklist; releases are in fact
+  cut as a single `chore(release)` commit on `main` plus an annotated `v*` tag, with everything from
+  the multi-arch build through promotion, anonymous publish verification and the GitHub Release
+  handled by `release.yml`. The section now carries the exact four-file commit, the gate commands to
+  run locally beforehand, what the pipeline does with the tag, how to recover from a failed gate
+  (nothing is published before `promote`, so the tag can be moved), and the post-release checks —
+  including doing the registry checks logged out.
+
+## [0.11.0] - 2026-07-27
+
+### Added
+
+- **All five SDKs gain poll sending, batch profile pictures, and status media downloads, and their
+  webhook filter types now match the server's polymorphic contract.** New `sendPoll`,
+  `profilePictures` (batch lookup returning `{id: url|null}`), and status `media` (binary bytes +
+  content type) methods in the JavaScript, Python, Go, PHP, and Java SDKs — the binary path is a
+  new `byte[]` end-to-end transport in Java. The webhook filter `value` is now
+  `string | string[] | boolean` with `caseSensitive` support in the typed SDKs (Go already
+  matched), `mentions` is accepted on send-text everywhere, and Java/Go non-JSON 2xx responses
+  behave like the other three SDKs (raw text / verbatim bytes instead of leaking parser errors).
+  (#947)
+
+### Fixed
+
+- **S3 storage no longer silently stays on the local fallback after a boot-time miss, the Baileys engine no
+  longer reports READY while its socket is in reconnect backoff, and the dashboard no longer serves cached
+  state across logout.** Four correctness fixes: if S3 was unreachable at boot, `StorageService` fell back
+  to local and never re-probed, so after S3 recovered writes kept landing in `./data/media` while reads hit
+  S3 `NoSuchKey` — a silent split-brain; it now re-probes on a 60s interval (`S3_REPROBE_INTERVAL_MS`),
+  WARNs while degraded, self-clears the timer on recovery, and the recovery is strictly one-way (false→true)
+  so a transient flake cannot drop a healthy deployment to local; while S3 is active, enumeration and the
+  storage totals also cover the local fallback directory and deletes go to both backends, so bytes written
+  during an outage stay visible to listings and reclaimable instead of being stranded. When the Baileys
+  socket entered reconnect backoff after a transient close, the adapter kept reporting `READY` for up to the
+  60s backoff cap while the socket was dead, so `probeLiveness()` returned true and `ensureReady()` let
+  sends through against a dead socket — it now sets `INITIALIZING` immediately on the transient close
+  (matching the whatsapp-web.js engine) and restores `READY` on the next `open`. The dashboard's React Query
+  cache survived logout (a re-login showed the previous user's sessions/messages), the startup re-validation
+  did not check `res.ok` (a 401/revoked key kept the cached role), the WebSocket client dropped
+  `subscribed`/ `error` frames (a scoped-key `FORBIDDEN_SESSION` was invisible), and `markChatRead` fired
+  per call without a debounce; all four are fixed (`queryClient.clear()` on logout, state-machine
+  validation, frame routing, a 750ms trailing coalescer). Separately, the `tecnativa/docker-socket-proxy`
+  compose entry set `DELETE: 1` which is dead config on the pinned v0.4.2 image (its method gate admits on
+  `POST` alone), so the SECURITY.md "least-privilege" claim oversold the boundary — the dead directive is
+  dropped, the README/SECURITY now document the real threat model (a compromised API container with `POST=1`
+  is host-root-equivalent), and the managed-profile teardown switched from `remove({ v: true })` (which
+  discarded anonymous volumes the disable/re-enable flow assumes) to a stop-only path that reports
+  per-profile errors honestly instead of claiming success on a 403. (#945, #944, #938, #934)
+
+- **The data export/import path and the backup/restore scripts no longer silently lose data, crash
+  the process, or write databases the app never opens.** Five integrity gaps in the export/import
+  endpoints (`GET /api/infra/export-data`, `POST /api/infra/import-data`, storage archive import)
+  are closed: each optional-table read was wrapped in a blind `try/catch` that debug-logged any
+  failure as "empty table", so a lock/IO/timeout produced an HTTP 200 "complete" backup that the
+  import then treated as authoritative — `DELETE`ing the rows the export never captured (now
+  rethrows everything except a genuine missing-table error, with the skipped tables listed in a new
+  `skippedTables` response field); the Postgres `body_ts` tsvector leaked into message exports via
+  `SELECT *` (now stripped); the `status_updates` table was missing from the backup flow entirely
+  despite the documented "all Data DB tables" contract (now exported/imported); a corrupt gzip or
+  mid-read I/O failure on `importFromStream` raised an unhandled `error` event that killed the
+  server, since neither the gunzip nor the input stream had an error listener (both now fail the
+  import promise and the controller maps it to 400); and the in-memory `lid -> phone` mirror was
+  left stale after a committed restore (now reloaded post-commit). The pre-flight now refuses a
+  full-replace restore that would orphan a running engine with **409 Conflict** listing the affected
+  sessions — pass `stopOrphans: true` to stop them inside the request (preferred), or `force: true`
+  to proceed and leave them running until restart (response carries `restartRequired` /
+  `orphanedEngines` / `stoppedOrphanEngines` / `failedOrphanEngines`). Separately,
+  `scripts/backup.sh` and `scripts/restore.sh` resolved database files from `OPENWA_DATA_DIR`,
+  which the app never reads — it opens `MAIN_DATABASE_NAME` / `DATABASE_NAME` with fixed `./data`
+  defaults — so a custom DB env path made backup exit 0 archiving nothing and restore write
+  databases the app never opened (next boot: fresh-empty, new API keys, new master key). Both
+  scripts now resolve DB paths exactly like the app, fail hard (non-zero + clear message) on a
+  missing source or an incomplete archive, and the production image ships `sqlite3` so in-container
+  backups take online-consistent snapshots via `sqlite3 .backup` (a `CONSISTENCY-WARNING` marker +
+  restore `--strict` gate cover the CLI-absent fallback). A new `Shell scripts` CI job runs the
+  backup/restore smoke suite and shellcheck on every change. **Breaking (behavior):** `backup.sh`
+  now exits non-zero where it previously reported success over an empty/partial archive — scheduled
+  jobs pointed at wrong paths will start alerting — and import/export responses gain additive fields
+  only. (#927, #926)
+
+- **Webhook delivery records now match what actually happened on the wire, and the Redis-backed
+  rate limiter no longer stalls or double-counts during a Redis outage.** On the webhook path, a
+  `lastTriggeredAt` bookkeeping update that threw after a 2xx receiver response used to flip the
+  outcome to failed — BullMQ/direct retry then re-POSTed an already-delivered event and filed a
+  dead-letter row for a successful delivery (the update is now isolated in its own try/catch and
+  the success outcome stands); parked and in-flight direct deliveries used to vanish on shutdown
+  with no record (the dispatch limiter now supports `close()`, `onModuleDestroy` dead-letters
+  parked deliveries, drains in-flight up to `WEBHOOK_SHUTDOWN_DRAIN_MS`, and logs anything still
+  running as abandoned); a BullMQ job that stalled twice failed without calling `process()` and so
+  bypassed the DLQ/metric/hook channels (a new `@OnWorkerEvent('failed')` handler records the same
+  dead-letter row for the stall sentinel); and the `webhook:before` hook could rewrite
+  `event`/`sessionId`/`timestamp`, making the signed body diverge from the `X-OpenWA-*` headers
+  (all identity fields are now re-asserted, and the serialized body is capped at
+  `WEBHOOK_MAX_PAYLOAD_BYTES`, default 1 MiB). On the throttler path, the ioredis client behind the
+  fail-open Redis storage was built with default `enableOfflineQueue: true` and no
+  `onModuleDestroy`/error listener, so a Redis outage queued every command (~8s per increment × 3
+  throttlers = ~24s+ per request) before the fail-open path engaged, resent unfulfilled `INCR`
+  evals after reconnect (double-counting, since `INCR` is not idempotent), and could hang
+  `app.close()` on a half-open socket. The client is now built fail-fast
+  (`enableOfflineQueue: false`, `autoResendUnfulfilledCommands: false`, `commandTimeout: 2000ms`,
+  `maxRetriesPerRequest: null`), owns its lifecycle via a structured error listener and a bounded
+  `quit()`/`disconnect()` drain, and a startup WARN fires when `WEBHOOK_SHUTDOWN_DRAIN_MS` (default
+  5s) is shorter than `WEBHOOK_TIMEOUT` (default 10s) — the cross that silently truncated in-flight
+  deliveries on shutdown. **Breaking (behavior):** legitimately huge webhook payloads above 1 MiB
+  are now recorded as undelivered rather than sent; a Redis answering slower than 2s degrades to
+  fail-open (allow) instead of eventually answering. (#933, #932)
+
+- **A session that exhausts its reconnect budget no longer leaks a concurrency slot or wedge its
+  restart.** When a session with a finite `config.maxReconnectAttempts` reached the terminal FAILED
+  branch of `scheduleReconnect`, it wrote FAILED but left the dead engine in the in-process map —
+  unlike the sister terminal path in `onError`, which evicts for the explicit reason that a leftover
+  engine holds a concurrency slot and makes the next `start()` reject the session as "already started".
+  The reconnect-exhaustion path now evicts the dead engine the same way `onError` does (guarded on
+  the engine being present, since the `executeReconnect`-catch caller already evicted its half-built
+  engine). Only affects sessions with an explicit finite `maxReconnectAttempts` (the default is
+  unlimited).
+
+- **`cancelBatch` no longer overwrites a terminally FAILED batch to CANCELLED.** The cancel guard
+  checked only COMPLETED and CANCELLED, so a post-completion cancel on a `stopOnError`-failed batch
+  (or any batch that resolved to FAILED) relabelled it CANCELLED, rewrote `progress.cancelled`/
+  `pending`, and masked the real delivery failures and the `message:failed` events that had already
+  fired. FAILED is now in the terminal-status guard, so each terminal status stays exclusive.
+
+- **The ingress queue now actually queues when `QUEUE_ENABLED=true`, persisted ingress events are reconciled
+  after silent-loss windows, and disabling one instance no longer tears down an enabled sibling sharing its
+  session scope.** The IntegrationModule never imported the QueueModule, so the `@Optional()` ingress queue
+  injection was always `undefined` and every delivery dispatched inline despite the operator-facing queued
+  contract (fast-ack, retries, ordering, DLQ) — the module now imports it conditionally (mirroring the
+  webhook module) and the boot fail-fast tripwire crashes startup loudly if the wiring ever regresses.
+  `ingress_events` was a dedup log but never a durability handle: a crash between persist and dispatch, a
+  failed fire-and-forget response route, or a swallowed inline failure lost the event while the provider's
+  honest retry deduped to a no-op. Rows now carry `dispatchState`/`dispatchAttempts`/`lastDispatchAt`
+  (legacy rows excluded), the enqueue path records outcomes, and a 60s reconciler (`INGRESS_RECONCILE_*`)
+  replays stuck deliveries with their original delivery id, retiring them terminally (plus a DLQ row) after
+  five attempts instead of looping forever; a replay first re-applies the eligibility check the live path
+  makes at the door, so an instance disabled or deleted after the persist is never handed the event.
+  Separately, disabling, deleting, or re-scoping an instance unconditionally stripped its session from the
+  plugin's `activeSessions` and wiped the per-session config even when another ENABLED instance shared that
+  scope; the teardown now checks for an enabled sibling first, and concrete activation preserves `'*'` while
+  a wildcard sibling is still enabled. (#921, #924, #922)
+
+- **Search-provider plugins now receive the finalized state of every outbound message, and two
+  runnable cURL examples in the API collection no longer 404.** The `message:persisted` hook fired
+  only for the initial PENDING row: the finalized SENT/FAILED save emitted nothing, and the
+  echo-merge that drops the redundant pending row left a ghost document no provider could correlate
+  (the pending row has no `waMessageId`). The hook now re-fires on every persisted transition as an
+  upsert keyed by the row id — SENT with the engine id, FAILED on send failure, the surviving row
+  after an echo-won merge — and a new `message:deleted` event fires for the dropped row, with
+  shallow-snapshot payloads so fire-and-forget delivery sees the state at emission time. Separately,
+  the history and reactions cURLs in `docs/07-api-collection.md` missed the `/messages` segment and
+  returned 404 when copied verbatim. (#919, #910)
+
+- **Restarting a session no longer SIGKILLs the live browser of a prefix-named sibling.** The
+  orphan-Chromium sweep matched the `--openwa-session=<id>` marker as a plain substring of the `ps`
+  command line, so restarting session `sales` killed the running browser of sibling `sales2`. The
+  marker is now matched token-exactly (whitespace/string-boundary delimited, session id
+  regex-escaped). (#923)
+
+- **Bootstrap and shutdown now fail loudly instead of coasting, and request metrics see the
+  traffic guards reject.** A failed HTTP bind (e.g. `EADDRINUSE`) after full Nest init used to
+  leave a port-less zombie driving WhatsApp sessions with `exitCode` set but no exit; the process
+  now runs a bounded best-effort teardown and exits 1. A teardown that rejects during SIGTERM
+  handling similarly ended in `exit 0` — it now exits 1 (a hung teardown is still bounded by the
+  second-signal force-exit). The RED metrics also stopped at the interceptor, so 401/403/429/404
+  rejections never reached `http_requests_total`; a boundary middleware now records them (unmatched
+  routes folded into a `(unmatched)` label) with a claim flag preventing double-counts on handled
+  requests. Separately, a `start()` that completed after its session row was deleted re-created the
+  just-purged auth dir and emitted QR/status events for the dead session; the retirement guard now
+  re-purges both engines' auth dirs (gated by a by-name re-check so delete+recreate keeps its fresh
+  dir) on the start and reconnect paths alike. (#949, #961, #952)
+
+- **Infra config writes are section-scoped, mode-aware, and strictly coerced, and the bootstrap config
+  guards cover the paths the app actually uses.** Saving config used to clobber sections absent from the
+  payload and carry stale secrets across mode flips (built-in `minioadmin`/`openwa` credentials surviving
+  into an external-blank config, which the production secret guard then rejected at the next boot — a
+  crash-loop with the dashboard dead); writes now merge per key, drop the old mode's secrets on a
+  builtin→external flip (`S3_ENDPOINT` clearable), keep a re-keyed built-in Postgres password instead of
+  re-stamping the bundled default on every save (it is reset only when switching in from an external
+  database), and re-run the production default-secret assertion at save time (400 before anything hits
+  disk). That assertion judges the configuration the next boot would actually see: a value supplied by the
+  host or orchestrator (compose `environment:`) takes precedence over the saved file just as it does at
+  boot, with a blank forward counting as unset, while values the loader itself merged in from `.env` and
+  `data/.env.generated` do not — so a save is judged on the config being written rather than on the one it
+  replaces. Controller-local DTOs moved to `dto/` with strict coercion, so a form-encoded `'false'` can no
+  longer persist as `'true'` for the boolean flags. The SQLite main/data path-collision guard now resolves
+  paths exactly like the runtime (and also fires for CLI migration invocations), `REDIS_ENABLED` is strictly
+  validated (a typo fails boot instead of silently downgrading the throttler and cache to in-memory), the
+  numeric env checks accept plain decimal digits only — an exponent or hex spelling (`1e6`, `0x100`) now
+  fails boot instead of validating as one number while the app, which reads these back with `parseInt`,
+  configures another — `WEBHOOK_MAX_PAYLOAD_BYTES` is validated positive-only (a `0` cap would reject every
+  webhook dispatch), and a boot sweep deletes `storage-export-*` archives orphaned by a restart after
+  `STORAGE_EXPORT_SWEEP_MAX_AGE_MS` (default 24h). Numeric knobs whose `0` is a documented opt-out now read
+  a blank or whitespace-only value — exactly what a compose `${KEY:-}` forward renders — as unset and fall
+  back to their default instead of parsing it as `0`: a blank `INGRESS_INSTANCE_LIMIT` used to mean a limit
+  of zero, which 429'd every inbound ingress webhook, and a blank `BULK_MAX_CONCURRENT_BATCHES` silently
+  meant unlimited. **Breaking (behavior):** partial config payloads now preserve omitted fields instead of
+  resetting them (the dashboard's full payload is byte-identical), and non-canonical `REDIS_ENABLED` values
+  — along with numeric variables spelled in exponent or hex notation — now fail boot. (#946, #960)
+
+- **Bulk batches re-validate rendered payloads and cancel terminally, and outbound rows stuck PENDING after
+  a crash are reaped.** Media presence/size was only checked at batch creation, so `{{variables}}` and the
+  `message:sending` hook could grow a payload past the cap afterwards — every item is now re-validated
+  post-gate (violations fail the item, honoring `stopOnError`). A cancel landing before the first item could
+  be fully overwritten by the cadence/final writes and send the whole batch anyway; all status transitions
+  are now DB-conditional on the current status, so CANCELLED stays terminal (only exact duplicate entries
+  are deduped first-wins at creation). Rows left PENDING when the process dies between the pre-send save and
+  the final save previously stayed PENDING forever (in the DB and in plugin search indexes); a periodic
+  reaper (`MESSAGE_REAPER_INTERVAL_MS`/`_GRACE_MS`/`_BATCH_SIZE`, defaults 10min/1h/50) marks them FAILED
+  with a `reapedAt` marker and re-emits `message:persisted` so hook-driven providers reconcile. The reap
+  write is itself conditional on the row still being PENDING, so a send that resolves between the sweep's
+  scan and its write keeps its own SENT outcome and engine message id. (#955, #958)
+
+- **API-key usage accounting no longer loses deltas, and the queue dashboard leaves an audit trail.** A
+  failed `pendingUsage` save dropped the accumulated delta and 500'd the request (the delta now merges back
+  and the request stands); nothing flushed on shutdown, so the last window's usage vanished (a bounded
+  `onModuleDestroy` flush now writes it). Bull Board rejected requests with no audit record and
+  queue-mutating UI actions left none either — 401/403s now write the standard failed-auth row (429s are
+  left to the limiter), and authenticated non-GET requests write a new `QUEUE_BOARD_MUTATED` action with
+  actor/method/path. The bootstrap `data/.api-key` file and boot banner pointed at keys after
+  rotation/revoke; the file is now removed when its key no longer validates (checked by hash at boot, and on
+  the revoke/delete paths) — unless a key row still carries the file's prefix, which means the hash miss
+  came from a changed `API_KEY_PEPPER` rather than a dead key: the file then survives and a WARN names the
+  repair (restore the original pepper, or rotate the key). (#963)
+
+- **Group participant batches, template renders, and status media are bounded and reconciled, and the
+  Postgres FTS probe reads the active schema.** Participant arrays accept at most 256 entries (the engine
+  works them serially) and a partially-failing settings patch now names the failed field instead of silently
+  half-applying. Rendered templates are capped at `TEMPLATE_RENDER_MAX_CHARS` (default 64 KiB) instead of
+  growing unbounded. Status media used to write the file before its row (a crash between them left a
+  permanent orphan) and purge deleted the row even when the file delete failed; ingest is now row-first with
+  `write_failed` recorded whenever the media ends up unattached — a failed file write or a failed post-write
+  row update — so the `status.received` webhook always names the reason for a missing attachment, purge
+  keeps the row for the next sweep when the file delete fails (and reports nothing purged when that is every
+  expired row), and a periodic sweep reclaims `statuses/` files no row references after a grace period,
+  walking that prefix in the store directly so a store larger than a single listing leaves no orphan
+  stranded. The search FTS probe queried `information_schema` unscoped, so a `POSTGRES_SCHEMA` deployment
+  could read a namesake table in another schema and pick the wrong availability posture in degraded states;
+  it now resolves the table through the session `search_path` via `to_regclass('messages')` and probe errors
+  fail closed without caching. **Breaking (behavior):** batches over 256 participants and renders over the
+  cap are now 400s. (#964, #966)
+
+- **Contract and documentation drift corrections.** `POST /api/sessions` returned the raw entity
+  (leaking `config`/`proxyUrl`) instead of the documented DTO — it now maps through
+  `SessionResponseDto` like the sibling routes. The OpenAPI exporter pinned no env, so the
+  snapshot could drift with the operator's configuration — `SEARCH_ENABLED`/`REDIS_ENABLED` are now
+  pinned for deterministic output (two exports under different envs are byte-identical), the
+  `calls`/`profile`/`search` tags and the metrics Bearer scheme are declared, and `GET /api/metrics`
+  is in the spec. Docs corrections: the README's audit-trail claim now matches the explicit
+  audit-coverage registry, the rate-limit header documentation shows the actual per-throttler
+  suffixed headers (and CORS exposes them), the testing doc reflects the current suite inventory
+  and CI jobs, and the phantom `DATABASE_SQLITE_PATH`/`DATABASE_URL`/`openwa.db` references are
+  replaced with the real `DATABASE_NAME`/`MAIN_DATABASE_NAME` variables and `./data/*.sqlite`
+  paths. (#953)
+
+### Security
+
+- **The HTTP body parser, the WebSocket gateway, and the plugin install path are now bounded against
+  memory-exhaustion and supply-chain attacks, and the dashboard's plugin frame and CSV export no longer leak
+  or inject.** Five hardening fixes: the bootstrap only enforced a **per-request** `BODY_SIZE_LIMIT`, so N
+  concurrent near-limit bodies pinned N×limit bytes before any guard ran (the throttler sits behind the body
+  parser) — a new aggregate in-flight body budget (`INFLIGHT_BODY_BUDGET_BYTES`, default 4× the per-request
+  cap) reserves `Content-Length` at admission, rejecting over-budget requests with 503 + `Retry-After` +
+  `Connection: close` (exactly-once release across finish/close/error/abort). A chunk-encoded body declares
+  no length, so it takes a small opening reservation that is then reconciled against the bytes actually read
+  off the socket — a tiny chunked upload never costs a whole request slot, and one that grows past the
+  aggregate is aborted mid-stream. Reservations cannot be squatted on either: a sender that ships headers
+  and then goes silent is dropped after 15s without new body bytes rather than holding its declared size
+  until Node's request timeout, while any progress resets that clock and a fully-received request is never
+  reaped no matter how long its handler runs. The request stream is never tapped, so consumers that attach
+  late — the multipart parser, running after the async guards — still see every chunk. The WebSocket gateway
+  had no rate limit on handshakes (every connect did a DB lookup), no per-key socket cap, and no per-frame
+  throttle — an unauthenticated connection flood, a valid-key frame flood, or socket exhaustion were all
+  open; it now enforces three independent limits (per-IP handshake window, per-key socket cap, per-token
+  frame bucket). The handshake window is charged before authentication, so a flood never reaches the key
+  lookup, and refunded once the handshake proves authentic — it therefore bounds **failed** handshakes,
+  while authenticated volume stays bounded by the socket cap and clients sharing one NAT or reverse-proxy
+  address cannot shut each other out of the dashboard. All three are memory-bounded by LRU maps with
+  re-insertion-on-touch so an active abuser cannot drift to the LRU head, and a new `RATE_LIMIT_EXCEEDED`
+  audit action is sampled at 1/min/kind+subject so the audit writes cannot themselves become the flood.
+  Plugin install accepted `http://` URLs with no integrity check (MITM-substitutable executable code); the
+  DTO now requires `https` and an optional sha256 pin carried via URL fragment (`#sha256=…`, never sent to
+  the server so a catalog download link can carry it), fail-closed on a malformed marker or a digest
+  mismatch — the fragment is the only honored marker, since a `sha256`/`checksum` query parameter belongs to
+  the download host and seizing it would mis-verify an unrelated URL. The dashboard plugin config UI
+  rendered in an `allow-scripts` sandbox that inherits the dashboard CSP (which allows any `https:`
+  `img-src`/`media-src`) — a meta-CSP (`img-src 'self' data:`, `media-src 'self' data:`, `connect-src
+  'none'`) is now injected as the frame's first `<head>` element, closing the egress channel `sandbox` alone
+  cannot block. The audit-log CSV export quoted only `,`/`\n`/`"`, so an attacker-influenced string starting
+  with `=`/`+`/`@`/`-` became a formula when an operator opened the export in a spreadsheet — cells are now
+  apostrophe-prefixed before structural quoting. **Breaking (behavior):** legitimate concurrent sends that
+  together exceed the aggregate body budget now get a transient 503 (raise `INFLIGHT_BODY_BUDGET_BYTES`),
+  and a client that sends request headers and then transmits nothing for 15s has its connection dropped; a
+  frame/handshake/socket that exceeds its limit is closed with a `RATE_LIMIT_EXCEEDED` audit row; a plugin
+  install over `http://` is now rejected (use `https://`); a config-UI plugin that hot-links remote media
+  will render broken until its CSP-compliant equivalent is used. (#936, #937, #942, #939)
+
+- **Release workflows now pin every GitHub Action to a commit SHA and stop re-pointing `:latest` on
+  every main push, and the production Docker build context no longer leaks `.git/`, agent
+  workspaces, stray databases, or `dashboard/node_modules` into image layers.** Two supply-chain
+  fixes: all 61 `uses:` across the workflow files were floating major tags (`@v7`, `@v4`), so a
+  compromised action update silently landed in jobs that handle publish secrets
+  (`docker/login-action`, `setup-java` GPG, `softprops/action-gh-release`, `build-push-action`) —
+  every ref is now pinned to its annotated-tag SHA (verified against `git ls-remote`) with a
+  `# vX.Y.Z` comment that Dependabot reads for monthly bumps. `ci.yml` re-pointed the registry
+  `:latest` tag on **every** main push, but the CI image is build-gated only (never runs the
+  release boot-smoke → promote discipline), so a broken-but-buildable image could become `:latest`;
+  `:latest` now moves only via `release.yml` after boot-smoke passes, a global `concurrency:`
+  group serializes overlapping tag pushes, and the `promote` step guards the mutable channels
+  (digest identity check before any re-point, prerelease minor-tag skip, per-tag post-promotion
+  digest verify). Separately, the `.dockerignore` rejected only root-anchored `node_modules/`,
+  `dist/`, `coverage/`, three `.env*` variants, and `data/` — leaking `.git/`, `dashboard/node_modules`,
+  `dashboard/dist`, `.env.production` / custom `.env` files, `*.sqlite`/`*.db`, `*.tsbuildinfo`, and
+  agent workspaces (`.claude/`, `.agent/`) into the build context and every image layer; the
+  dockerignore is now complete, a `check-dockerignore.mjs` gate (real Docker-matching semantics,
+  29 reject + 16 keep paths) runs as a hard CI gate in both `ci.yml` and `release.yml`, the
+  `postinstall` lifecycle script is extracted to `scripts/postinstall.js` with failure propagation
+  (a broken `dashboard/package-lock.json` or half-applied wwebjs patch now fails `npm install`
+  instead of silently exit 0), and the Dockerfile copies the hook before `npm ci` so the install
+  can find it. **Breaking (behavior):** `docker pull openwa:latest` after a main merge no longer
+  moves the tag — only a tagged release does; `npm install` now fails where it previously reported
+  success over a broken dashboard/patch. (#940, #943)
+
+- **The create-instance and regenerate-secret responses no longer echo plaintext values for secret-flagged
+  config fields, and the whatsapp-web.js engine no longer reports phantom success for operations it never
+  performed.** Two related honesty fixes: `(POST /integration/plugins/:pluginId/instances,
+  …/regenerate-secret)` rendered the raw instance row when `reveal=true`, bypassing `maskedView` — so any
+  config field flagged `secret: true` at any nesting depth (a nested `credentials.apiToken`, an array-row
+  `webhooks[].signingKey`) was returned in plaintext alongside the one-time ingress secret/verifyToken
+  reveal. The view builder now always starts from `maskedView` (fail-closed when the schema is unavailable)
+  and unmasks only the two documented "revealed once" fields. Separately, several whatsapp-web.js adapter
+  methods reported success for work that never happened: `subscribeToChannel` fabricated `{id:"undefined"}`
+  from a boolean return, `add/remove/promote/demoteParticipants` discarded the per-participant outcome (so a
+  403 not-admin / 404 not-registered / 409 already-member was a plain 2xx), the catalog reads
+  (`getCatalog/getProducts/getProduct`) were phantom stubs returning `null`/`[]`, and a dead Chromium page
+  was folded into a 404/400 not-found. These now answer honestly: 501 for the unwired catalog/subscribe
+  paths, 403 on a total participant refusal or a discarded `false` boolean
+  (subject/description/unsubscribe), 503 with `EngineTransportError` for a transport death, and an additive
+  `results` field on the four participant endpoints carrying the per-participant outcome. Where
+  whatsapp-web.js delivered a private group invite instead of adding the member, that entry is a success
+  carrying the 403 status and an invite-sent message, so an all-invite batch resolves rather than reading as
+  a total refusal; the remove/promote/demote entries, which the library only confirms as a whole batch, say
+  so in their message instead of implying an individually confirmed outcome. `getProfilePicture` received
+  the same transport-death treatment for consistency. **Breaking (behavior):** callers that previously read
+  their own config secret back from the create response now receive `***`, and any client that programmed
+  against a phantom 2xx for the engine operations above will see the new 4xx/5xx where the operation
+  genuinely cannot succeed. Response envelopes are otherwise additive only. (#929, #925)
+
+- **Plugin ingress routes with `signature.scheme: 'none'` now require an explicit opt-in.** A `none`-scheme
+  route is an unauthenticated `@Public()` endpoint that, once an integration instance is provisioned
+  against it, lets anyone who can reach the host POST a forged payload that triggers outbound WhatsApp
+  sends on the bound session. The loader previously only logged a warning for such routes, so the
+  surface lit up silently as soon as an operator installed a plugin declaring one. `validateIngressManifest`
+  now rejects any `none`-scheme route unless `ALLOW_UNSIGNED_INGRESS=true` is set; signed schemes
+  (`hmac-sha256`, `standard-webhooks`, `shared-secret`) are unaffected, and both official ingress
+  plugins (`chatwoot-adapter`, `supabase-otp-hook`) declare signed schemes. When the opt-in is set, the
+  existing boot warning still fires so the operator is reminded to front the route with a network ACL.
+
+- **Secret comparisons on the `/api/metrics` Bearer and ingress `shared-secret` auth surfaces no
+  longer leak the expected token's byte-length.** Both `safeEqualStr` (ingress `shared-secret` verify)
+  and `MetricsService.safeEqual` (`/api/metrics` Bearer) used the common `timingSafeEqual` idiom of
+  early-returning on a buffer length mismatch — but that early return is itself a timing channel: a
+  caller who can time the response learns whether their candidate matches the expected secret's
+  length. Both now delegate to a shared `constantTimeEqual` helper that hashes both inputs with a
+  per-process random key (fixed-length SHA-256 digests) and `timingSafeEqual`s those, so the value
+  comparison stays constant-time and neither input's length affects control flow. The `hmac-sha256`
+  and `standard-webhooks` schemes compare fixed-length digests and were not affected.
+
+- **npm dependency vulnerabilities pinned via `overrides` (root + dashboard).**
+  `brace-expansion` bumped to `^5.0.8` (CVE-2026-14257, ReDoS; was present at
+  both 2.1.2 and 5.0.7 in the root tree, and 5.0.6 in the dashboard tree) and
+  `js-yaml` to `^5.2.2` (GHSA-pm4m-ph32-ghv5, exponential parsing DoS) in the
+  root `package.json`. Both fixes are pulled in through transitive dependencies;
+  the overrides consolidate the tree onto the fixed versions with no source
+  changes and shrink `package-lock.json` by ~240 lines from dedup.
+
+- **Release images are now scanned for OS-package CVEs before they get public tags.** A new
+  `image-scan` job in the release workflow runs `trivy image` against the freshly-built staging
+  image on both `linux/amd64` and `linux/arm64`, and blocks the `promote` step (which applies the
+  `X.Y.Z`/`X.Y`/`latest` tags) on any fixable HIGH/CRITICAL. This covers the Debian packages baked
+  into `node:22-slim` — and the arm64-only `chromium` packages — that the source-tree `npm audit`
+  gate cannot see, plus the dependency tree bundled inside the image's own npm CLI: the production
+  image now installs npm 12 over the 10.9.8 the base image ships, clearing a critical `node-tar`
+  advisory along with `sigstore` and `picomatch` ones. A single accepted finding is carried in
+  `.trivyignore` with its justification and the condition for removing it; everything else still
+  blocks promotion. Runs at release time only, so it never touches fork-PR token permissions.
+
+- **Session-scoped API keys can no longer escape their fence through key management or integration instance
+  management, and plugin `conversation.send` now verifies the mapping belongs to the envelope's session.**
+  The guard enforces `allowedSessions` only against the `:sessionId` route param, so surfaces without one
+  slipped through: every `/api/auth/api-keys` route (a scoped ADMIN could mint an unrestricted ADMIN key,
+  clear another key's scope, or enumerate all credentials — a total, persistent escape) and the integration
+  instance routes (whose `sessionScope` travels in the request body and persisted rows the guard never
+  sees). A new `@RequireUnscopedKey()` marker rejects any allowlisted key on the key-lifecycle controller
+  (403, audited via the existing failed-auth trail), and instance create/patch/redrive now intersect the
+  requested and persisted scopes with the caller's allowlist — out-of-scope instances answer 404
+  (indistinguishable from missing, so they cannot be probed), and an all-sessions scope is uncreatable by
+  scoped keys. Separately, `conversation.send` resolved a provider-conversation mapping without comparing
+  its `sessionId` to the envelope session, so a stale mapping after a scope move could send on the wrong
+  WhatsApp session; the lookup now fails closed on any mismatch (an explicit `chatId` in the envelope is
+  unaffected) — except when the mapping's own session no longer exists, which means the operator deleted and
+  re-paired it: the row is stale rather than cross-session, so it is rebound to the envelope's (already
+  activation-gated) session and the send proceeds, and a mapping upsert that collides with such a dead
+  session's row supersedes it instead of failing forever. Without that repair a deleted session's rows
+  bricked `conversation.send` for that conversation permanently. A mapping owned by another live session is
+  still a genuine violation and still fails closed. **Breaking (behavior):** session-scoped ADMIN keys now
+  get 403 on all key-management routes and can only manage instances bound inside their own sessions;
+  unrestricted keys (including the bootstrap key) are unchanged. (#916, #920)
+
+- **The last-admin guard is race-safe, and webhook media fan-out is bounded.** The last-usable-admin check
+  ran check-then-act across an `await`, so two concurrent demote/delete requests against the last two admins
+  both passed and produced a total management lockout; the check and its mutation now share one in-process
+  mutex (a DB transaction cannot provide this atomicity on the better-sqlite3 driver), entered whenever the
+  target key is an ADMIN and the operation can strip its capability, with the target re-read inside the
+  critical section so the decision never runs against a pre-lock snapshot. A usable admin is an active,
+  unexpired ADMIN key with no session scope: the key-lifecycle routes are fenced behind
+  `@RequireUnscopedKey()`, so a session-scoped admin can authenticate but can never manage keys, and
+  counting it as a survivor would bless the removal of the last key that can — a lockout with no in-band
+  recovery, since the boot seed only re-seeds an empty key table. Applying a session scope to the last
+  unscoped admin is therefore refused with **409 Conflict**, exactly like demoting, revoking, deleting, or
+  expiring it. On the webhook side, one inbound media message cloned its full base64 payload per registered
+  webhook (with no per-session webhook cap) and retained it in Redis on failure: new registrations above
+  `WEBHOOK_MAX_PER_SESSION` (default 16; existing webhooks grandfathered) are rejected, media above
+  `WEBHOOK_MEDIA_INLINE_MAX_BYTES` (default 1 MiB) travels as an omitted marker instead of inline base64,
+  oversized serialized bodies shed their media before enqueue (delivering the event as a marker rather than
+  dropping it), and the serialized bytes are built once per delivery for both signing and posting.
+  **Breaking (behavior):** media above the inline threshold now arrives as a marker (fetch it via history or
+  raise the knob), and webhook registration past the cap returns 400. (#950, #948)
+
+- **The plugin sandbox runtime is bounded and no longer fails silently.** A hung plugin could pin all 32
+  in-flight capability slots forever — capability RPCs now time out (`PLUGIN_CAP_TIMEOUT_MS`, default 30s),
+  freeing the slot and logging late settles as warnings (worker work already running is not cancelled, by
+  design). Hook handler errors inside the sandbox were swallowed wholesale; the first handler error per hook
+  now surfaces as a rate-limited structured host log and in the plugin's health check, and a plugin whose
+  load fails at boot has its registry entry reconciled to ERROR instead of still reporting installed/enabled
+  (the operator config is preserved, and a later successful load restores the status). Per-plugin storage
+  writes are quota-bounded (`PLUGIN_STORAGE_MAX_BYTES`, default 50 MiB) and the log relay truncates, caps
+  throughput per plugin, and flushes its dropped-line count on worker exit so a plugin that goes quiet
+  before the window rolls over still reports what it dropped. Plugin search-provider responses are validated
+  at the host boundary — malformed hits/totals now fail with 502 instead of a bogus 200/500.
+  `conversation.send` with `type: 'location'` fell through to an empty text message; coordinates are now
+  part of the envelope and send a real location (invalid ranges are rejected). **Breaking (behavior):**
+  malformed plugin search results now 502, and plugins relying on the empty-text fallthrough get an explicit
+  error. (#954)
+
+### Changed
+
+- **Dashboard stats aggregates now use a standalone `messages(createdAt)` index and a short TTL
+  memo, and ingress replay/dedup-row growth is now bounded.** The dashboard timeline and stats
+  queries (`getOverview`, `getMessageStats`) filter on `createdAt` alone (`WHERE m.createdAt >=
+  :since`, no `sessionId`), which the existing composite `(sessionId, createdAt)` cannot serve
+  (Postgres has no skip-scan; SQLite without `ANALYZE` full-scans) — a new standalone index
+  `IDX_messages_createdAt` serves the predicate directly (the migration lifts the runtime
+  `statement_timeout` on Postgres to mirror the sibling index migrations), and the per-period
+  aggregates are memoized for `STATS_CACHE_TTL_MS` (default 30s) so a dashboard refresh no longer
+  re-runs the cross-session `GROUP BY` on every call. Separately, ingress replay protection and
+  the dedup-row store grew without bound: a route declaring `timestampHeader` alone hit a freshness
+  trap (the per-route `toleranceSec` was undefined, so the skew check 401'd every delivery), and
+  the full `{headers,query,body,rawBody}` payload (~512 KiB/row) was retained for the full 90-day
+  window — replay windows are now enforced whenever `timestampHeader` is declared, with a host-wide
+  `INGRESS_TIMESTAMP_TOLERANCE_SEC` fallback (default 300s, Standard-Webhooks convention); dedup
+  rows retire to 7 days (`INGRESS_DEDUP_RETENTION_DAYS`) while DLQ rows keep the 90-day compliance
+  window, and the payload is slimmed to NULL the moment an outcome is recorded (a sha256
+  `payloadHash` stays as the permanent fingerprint). The dedup bound is TTL-only (no row cap) — a
+  count cap would evict legit dedup rows under a forged-id flood and re-admit their replays, which
+  the per-instance ingress throttle already bounds. **Breaking (behavior):** dashboard stats now
+  lag by up to `STATS_CACHE_TTL_MS` (default 30s); an ingress route with `timestampHeader` but no
+  per-route `toleranceSec` now accepts deliveries (previously 401'd) using the host-wide default.
+  (#935, #941)
+
+- **The message `from`-filter now matches group authors, JID candidate expansion is scoped by chat
+  kind, and session delete purges both engines' auth directories.** `GET /api/sessions/:id/messages
+  ?from=<phone>` filtered only the `from` column, but both engine mappers store a group message's
+  real sender in `author` (with the group JID in `from`), so the filter silently skipped every
+  group message that person wrote. It now matches `(message.from IN (:…) OR message.author IN (:…))`
+  against the same lid-expanded candidate set. `resolveJidCandidates` previously expanded ANY filter
+  value into the user dialects and probed the lid table with its digits — so a group/newsletter
+  chatId (`120363…@g.us`, `12345@newsletter`) could mis-resolve onto an unrelated user chat whose
+  phone digits matched, and a `@lid` input never forward-resolved to its phone; candidates are now
+  scoped by `parseWaId` kind (user/unknown keep the expansion, `@lid` forward-resolves via
+  `getCached`, group/status/newsletter/broadcast fail closed on the literal id). Separately,
+  `DELETE /sessions/:id` only purged the currently-active engine's auth directory, so a session
+  that ever ran under both engines (linked on whatsapp-web.js, deployment switched to baileys, or
+  vice versa) kept the other engine's WhatsApp credentials on disk after "delete" — leftovers that
+  could silently re-link on switchback and were carried into backups. `EngineFactory.purgeSessionData`
+  now removes both engine dir shapes (keyed by session name, behind the existing
+  `isSafeSessionName` traversal guard and isolated best-effort per engine); start-time purge is
+  deliberately unchanged so trialling the other engine keeps the previous link for rollback.
+  **Breaking (behavior, from-filter):** filtering `from` by a phone now also returns that person's
+  group messages — consumers that worked around the old miss by filtering client-side will simply
+  see the rows they expected. (#931, #928)
+
+- **Ten operator-tunable environment variables are now documented in `.env.example`.**
+  `INGRESS_MAX_ATTEMPTS`, `INGRESS_RETRY_DELAY_MS`, `INGRESS_RETENTION_DAYS`, `SSRF_DNS_TIMEOUT_MS`,
+  `INGRESS_WORKER_CONCURRENCY`, `WEBHOOK_WORKER_CONCURRENCY`, `INBOUND_MEDIA_CONCURRENCY`,
+  `STATUS_MEDIA_MAX_BYTES`, `PLUGIN_DOWNLOAD_MAX_BYTES`, and `BULK_MAX_CONCURRENT_BATCHES` are read from the
+  environment with sensible defaults but were absent from the configuration reference. Each is now
+  documented next to its related block, with the exact default and the parse semantics
+  (`INGRESS_RETENTION_DAYS <= 0` disables pruning, `BULK_MAX_CONCURRENT_BATCHES = 0` is unlimited, the DoS
+  trade-off on `SSRF_DNS_TIMEOUT_MS`). The numeric knobs whose `0` is a documented opt-out also share one
+  parse rule now: the value must be plain decimal digits, an explicit `0` selects that knob's opt-out
+  (unlimited for `BULK_MAX_CONCURRENT_BATCHES` and `LID_MAPPING_CACHE_MAX`, sweep-off for
+  `MESSAGE_REAPER_INTERVAL_MS` and `INGRESS_RECONCILE_INTERVAL_MS`), and a blank or otherwise unparseable
+  value falls back to the documented default rather than the opt-out — a compose `${KEY:-}` forward or a
+  stray typo can no longer silently disable a cap, a sweep, or a retry backoff.
+
+- **Dockerfile `apt-get install` invocations now use `--no-install-recommends`**
+  (build-stage build deps and production-stage Chromium/Puppeteer deps).
+  Smaller image; no behavior change for the explicitly-listed packages.
+
+- **The in-memory `@lid -> phone` mirror is now bounded by an LRU cap (`LID_MAPPING_CACHE_MAX`,
+  default 5000).** The mirror backs synchronous sender resolution on the dispatch hot path; it was
+  write-through but never evicted, so on a long-running, contact-heavy account it accumulated one
+  entry per distinct privacy-LID sender ever seen — a slow memory leak, and the lone unbounded
+  long-lived map in the process. `getCached` now touches the entry so iteration order tracks recency,
+  and the map evicts the least-recently-used entry when it exceeds the cap; the reverse `phone -> lids`
+  map is reconciled on each eviction. A cache miss falls back to engine re-resolution (the table
+  remains the source of truth), so the cap trades a re-resolution for bounded memory, never data loss.
+  `LID_MAPPING_CACHE_MAX=0` restores the legacy unbounded behaviour.
+
+- **The Kubernetes deployment example now ships with OS-level containment, matching the shipped
+  Docker image.** The StatefulSet in `docs/13-horizontal-scaling.md` previously had no
+  `securityContext`, so an operator following the manifest ran the plugin sandbox without its
+  OS-containment half (read-only rootfs, non-root, `cap_drop: ALL`) — weaker than the threat model
+  assumes. The manifest now sets `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation:
+  false`, and `capabilities.drop: ['ALL']`, with the writable `/app/data` and `/tmp` mounts that
+  `readOnlyRootFilesystem` requires. The stale image tag (`0.4.6`) was also bumped to the current
+  release.
+
+- **The plugin sandboxing doc no longer lists `auto-reply` and `translation` as built-in extensions.**
+  Both ids were removed in v0.7 (`LEGACY_REMOVED_PLUGIN_IDS`), but `docs/23-plugin-sandboxing.md`'s
+  trust-tiers table still named them as built-in examples — misleading an operator about what counts
+  as a trusted in-process plugin. The table now names only the two engine adapters, matching
+  `docs/19-plugin-architecture.md` and the code.
+
+- **The default WhatsApp Web version pin now discloses its trust posture instead of being
+  misdocumented as a library auto-select.** With `WWEBJS_WEB_VERSION` unset, `auto`, or `latest`,
+  OpenWA resolves a settled build from the third-party `wppconnect-team/wa-version` registry and
+  pins its HTML — content executed inside the authenticated `web.whatsapp.com` origin without an
+  integrity check (the pin exists to avoid the scan→stuck→disconnect-loop class, #488/#684) — but
+  `.env.example`, both compose files, the adapter comment, and the troubleshooting FAQ all claimed
+  unset/`off` alike "let whatsapp-web.js auto-select". The docs now describe the real default and
+  its trust implication, only `WWEBJS_WEB_VERSION=off` selects the first-party build served by
+  WhatsApp, and a once-per-process WARN at pin time names the resolved version, the source URL, and
+  the opt-outs (an operator-controlled copy via `WWEBJS_WEB_VERSION_REMOTE_PATH`). The active build
+  and its source (`pinned`/`auto`/`native`) remain visible on the dashboard's Infrastructure page.
+  (#917)
+
+- **The peer-fed Baileys session maps and chat-history inline media are now bounded, and an RFC for
+  wa-version content integrity is open for a maintainer decision.** `BaileysSessionStore` held five
+  unbounded maps fed by peer traffic (contacts, chats, lastMessages, lid, ephemeral markers); all are now
+  LRU-capped at `BAILEYS_SESSION_STORE_MAX_ENTRIES` (default 5000, `0` restores unbounded) with defined
+  fallbacks on eviction. `getChatHistory(includeMedia=true)` accumulated up to ~100 × 50 MiB of base64 in
+  one response with no way to cancel — an aggregate budget (`CHAT_HISTORY_MEDIA_BUDGET_BYTES`, default 25
+  MiB) now omits further media behind the existing `omitted` marker, and the loop honors request abort. A
+  caller that ingests into a store rather than into one HTTP response — the status seed, which passes its
+  own per-item media cap — is budgeted from that cap instead of the response default, so a story feed
+  carrying several full-size videos is stored whole while the pass stays bounded.
+  An RFC analyzes the structural options for
+  integrity-checking the pinned WhatsApp Web HTML (per-release hash allowlist, signed hash channel/mirror,
+  documented accepted-risk, operator pins) and asks the maintainer for a decision; the transparency layer
+  (warn log, accurate docs, dashboard source badge) already shipped. (#951, #962)
+
+- **MCP tool inputs now enforce the same caps as the REST DTOs, and the dashboard's catalogs and modals are
+  complete.** Nine MCP tool fields (location description/address, contact name/number, reply text, reaction
+  emoji, group name/subject/description) accepted values the equivalent REST endpoints reject — the Zod
+  schemas now share the DTOs' cap constants, including the 256-entry participant cap on the group create/add
+  tools. `GroupAddParticipants` also returns the per-participant `results` and derives its `success` flag
+  from them, so a batch in which every participant was refused (not registered, already a member) no longer
+  reports success to the caller; a partial refusal reports how many were added rather than failing the
+  batch. On the dashboard, 15 `plugins.*` keys used by the Plugins page are translated in all 12 locales,
+  count badges use real plural forms (including the Arabic and Hebrew category sets),
+  `failed`/`authenticating` session statuses render localized in both status renderers, and all 13
+  hand-written modals moved to the shared Modal with `role="dialog"`, focus trap + restore-to-trigger,
+  Escape-to-close, and background scroll-lock. (#959, #965)
+
+- **CI now boots the queued dispatch path against a real Redis, and the Docker managed profiles
+  match compose.** A new `queue-on` e2e suite starts the app with `QUEUE_ENABLED=true` against a
+  Redis service (new in the CI test job) and proves ingress deliveries and webhooks actually travel
+  the BullMQ queues to their workers — the posture that previously shipped green while always
+  dispatching inline (the suite skips gracefully without a local Redis). DockerService's managed
+  containers now pin the same MinIO release as compose and set `no-new-privileges`, a
+  compose-parity spec locks the contract, and SECURITY.md's supported-versions table reflects the
+  current linear release policy. (#967, #968)
+
 ## [0.10.10] - 2026-07-25
 
 ### Added
