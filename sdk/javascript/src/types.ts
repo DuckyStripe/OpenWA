@@ -21,7 +21,14 @@ export type ChatKind = 'individual' | 'group' | 'channel' | 'status' | 'broadcas
 
 /** Session lifecycle status. */
 export type SessionStatus =
-  'created' | 'initializing' | 'qr_ready' | 'authenticating' | 'ready' | 'disconnected' | 'failed';
+  | 'created'
+  | 'initializing'
+  | 'qr_ready'
+  | 'authenticating'
+  | 'ready'
+  | 'disconnected'
+  | 'action_required'
+  | 'failed';
 
 /** Minimal success envelope returned by some state-changing endpoints. */
 export interface SuccessResult {
@@ -41,8 +48,15 @@ export interface SessionResponse {
   lastActive?: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Only present when `status === 'failed'`. */
+  /** Only present when `status === 'failed'` (terminal failure) or `status === 'action_required'` (operator must intervene). */
   lastError?: string | null;
+  /**
+   * Whether the gateway holds a live engine for this session right now — the precondition `stop`,
+   * `logout` and `force-kill` require and `start` refuses. Not derivable from `status`:
+   * `disconnected` covers both a session mid automatic-reconnect (engine present) and one stopped
+   * with no engine. Absent from a gateway that predates the field.
+   */
+  engineLoaded?: boolean;
 }
 
 export interface CreateSessionRequest {
@@ -92,6 +106,8 @@ export interface SendTextRequest {
   chatId: Jid;
   /** Max 4096 chars. */
   text: string;
+  /** WIDs to @mention (e.g. `["62811@c.us"]`). The text must also contain the `@<number>` token. */
+  mentions?: string[];
 }
 
 export interface SendMediaRequest {
@@ -177,6 +193,16 @@ export interface SendTemplateRequest {
   templateName?: string;
   /** Template variables (server DTO field is `vars`). */
   vars?: Record<string, string>;
+}
+
+export interface SendPollRequest {
+  chatId: Jid;
+  /** Poll question / title (max 255 chars). */
+  name: string;
+  /** Options to vote on (WhatsApp allows between 2 and 12). */
+  options: string[];
+  /** Allow voters to pick several options (default single choice). */
+  allowMultipleAnswers?: boolean;
 }
 
 export interface ListMessagesQuery {
@@ -364,6 +390,11 @@ export interface ProfilePictureResponse {
   url: string | null;
 }
 
+/** Batch profile-picture lookup: a map of contact id → picture URL (null when the lookup failed). */
+export interface ProfilePicturesResponse {
+  pictures: Record<string, string | null>;
+}
+
 export interface ContactPhoneResponse {
   contactId: Jid;
   phone: string | null;
@@ -502,7 +533,13 @@ export type WebhookEvent =
 export interface WebhookFilterCondition {
   field: string;
   operator: string;
-  value: string[];
+  /**
+   * Polymorphic per field kind: a single string (text fields), a string array
+   * (id/idArray/enum fields), or a boolean (boolean fields).
+   */
+  value: string | string[] | boolean;
+  /** Only meaningful for text fields (`contains`/`equals`). Defaults to false. */
+  caseSensitive?: boolean;
 }
 
 export interface WebhookFilters {

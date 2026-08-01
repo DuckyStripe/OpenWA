@@ -22,6 +22,7 @@ export enum EngineStatus {
   QR_READY = 'qr_ready',
   AUTHENTICATING = 'authenticating',
   READY = 'ready',
+  ACTION_REQUIRED = 'action_required',
   FAILED = 'failed',
 }
 
@@ -33,6 +34,7 @@ export interface MessageResult {
 export interface MediaInput {
   mimetype: string;
   data: Buffer | string; // Buffer or base64 or URL
+  /** Caller-supplied filename wins. Document sends fall back to 'file' when omitted (wwebjs first derives the URL basename); image/video/audio sends carry no filename. */
   filename?: string;
   caption?: string;
   /** Neutral WIDs (`<phone>@c.us`) to @mention in the caption. The adapter de-normalizes per engine. */
@@ -188,6 +190,26 @@ export interface GroupParticipant {
   name?: string;
   isAdmin: boolean;
   isSuperAdmin: boolean;
+}
+
+/**
+ * Outcome of a group membership write (add/remove/promote/demote) for ONE participant. Engines
+ * that report per-participant results map them verbatim (whatsapp-web.js `addParticipants` resolves
+ * a `{[participantId]: {code, message}}` object; Baileys `groupParticipantsUpdate` resolves a
+ * `[{status, jid}]` array); engines that only confirm the batch as a whole (whatsapp-web.js
+ * remove/promote/demote resolve `{status: 200}`) report one success entry per requested participant.
+ * `status` is the engine's own code when it reported one (e.g. 200 ok, 403 invite-only/not-admin,
+ * 404 not registered, 409 already a member).
+ */
+export interface ParticipantOperationResult {
+  /** Neutral participant id the outcome belongs to. */
+  id: string;
+  /** True only when the engine confirmed the change for THIS participant. */
+  success: boolean;
+  /** Engine-reported status code, when it gave one. */
+  status?: number;
+  /** Engine-reported human-readable reason, when it gave one. */
+  message?: string;
 }
 
 export interface GroupInfo {
@@ -509,6 +531,17 @@ export interface EngineEventCallbacks {
   onDisconnected?: (reason: string) => void;
   onStateChanged?: (state: EngineStatus) => void;
   /**
+   * Fired when the engine needs an operator action to keep the session healthy — currently only the
+   * whatsapp-web.js onboarding-modal fallback (#982): a new account shows a "What's new" modal after
+   * linking that must be acknowledged, and the adapter dismisses it automatically; this fires only if
+   * that dismissal fails, so a headless deployment is told (rather than left to be logged out ~5m
+   * later). The engine has already moved to ACTION_REQUIRED; `reason` carries a human-readable cause.
+   * Distinct from `onError` (terminal) and `onDisconnected` (recoverable): it does NOT clear on its
+   * own — once the operator has acted, the session must be restarted (stop, then start) to return
+   * to READY.
+   */
+  onActionRequired?: (reason: string) => void;
+  /**
    * Fired on a terminal initialization/authentication failure (e.g. Chromium
    * could not launch, or WhatsApp rejected the stored credentials). The engine
    * has already moved to FAILED; `reason` carries a human-readable cause that
@@ -516,6 +549,40 @@ export interface EngineEventCallbacks {
    * recoverable and triggers reconnection.
    */
   onError?: (reason: string) => void;
+  /**
+   * Fired SYNCHRONOUSLY the instant a credential-teardown operation begins — i.e. the moment the
+   * adapter kicks off the call that ends in an `fs.rm` of this session's on-disk WhatsApp auth
+   * directory. The argument is the SAME promise the adapter is about to await (or, for a
+   * WhatsApp-originated unlink, a promise the adapter controls that represents the same rm).
+   *
+   * Unlike the other callbacks, this one is NOT guarded on the engine still being live: a logout
+   * that captured the engine registers its destructive promise even as a concurrent stop()/delete()
+   * evicts that engine, because the rm it ends in targets the session NAME's auth dir and would
+   * otherwise race a (re)created session under that same name. The lifecycle tracks the promise
+   * (keyed by the immutable captured session NAME) so start()/delete()/executeReconnect can wait
+   * (bounded, fail-closed) for it to settle before touching that path.
+   *
+   * Adapters that never remove credentials on their own (e.g. Baileys until a later task wires its
+   * WhatsApp-originated cleanup) simply never invoke this.
+   */
+  onCredentialTeardownStarted?: (operation: Promise<void>) => void;
+  /**
+   * Synchronous atomic claim for ONE automatic credential-reset attempt within a single reconnect
+   * episode. The adapter calls this BEFORE it begins the destructive credential reset that ends in
+   * an `fs.rm` of this session's on-disk auth dir (the stuck-auth recovery path: a session that
+   * authenticated but never reached readiness). Returns `true` exactly once per episode — the claim
+   * is owned by the session lifecycle, so it survives an automatic reconnect that builds a FRESH
+   * adapter (which would otherwise reset an instance-local budget and wipe LocalAuth every
+   * generation, looping forever). Returns `false` once the budget is spent, and the adapter MUST
+   * then fail terminally (FAILED + `onError`) WITHOUT touching the auth dir.
+   *
+   * SYNCHRONOUS by contract: the race between the stuck-auth timeout and any concurrent
+   * start()/reconnect is resolved within a single event-loop turn. The adapter does NOT await it.
+   *
+   * Optional: when absent (standalone adapter use/test, no session lifecycle) the adapter falls back
+   * to its own instance-local one-shot boolean so standalone behavior is unchanged.
+   */
+  claimStuckAuthRecovery?: () => boolean;
 }
 
 export interface IWhatsAppEngine {
@@ -590,10 +657,16 @@ export interface IWhatsAppEngine {
   // Groups - Extended (Phase 3)
   getGroupInfo(groupId: string): Promise<GroupInfo | null>;
   createGroup(name: string, participants: string[]): Promise<Group>;
-  addParticipants(groupId: string, participants: string[]): Promise<void>;
-  removeParticipants(groupId: string, participants: string[]): Promise<void>;
-  promoteParticipants(groupId: string, participants: string[]): Promise<void>;
-  demoteParticipants(groupId: string, participants: string[]): Promise<void>;
+  /**
+   * Membership writes resolve one {@link ParticipantOperationResult} per participant, so a partial
+   * refusal (one invite-only number among several added) is visible instead of being flattened into
+   * a blanket success. They THROW only when the operation failed for every requested participant —
+   * e.g. the account lacks admin rights — or the batch itself was refused.
+   */
+  addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
+  removeParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
+  promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
+  demoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
   leaveGroup(groupId: string): Promise<void>;
   setGroupSubject(groupId: string, subject: string): Promise<void>;
   setGroupDescription(groupId: string, description: string): Promise<void>;
@@ -625,12 +698,17 @@ export interface IWhatsAppEngine {
    * Read a chat's recent messages, newest first. When `includeMedia` downloads blobs, an optional
    * `mediaMaxBytes` tightens the declared-size pre-gate below the global MEDIA_DOWNLOAD_MAX_BYTES —
    * the status seed uses it to skip downloads the store would discard as over-cap anyway.
+   * Inlined media is additionally bounded in aggregate (CHAT_HISTORY_MEDIA_BUDGET_BYTES): once the
+   * running base64 total crosses the budget, later media messages carry the `omitted` marker instead
+   * of a download. An optional `signal` (e.g. client disconnect) stops the read loop early; the
+   * messages collected so far are returned.
    */
   getChatHistory(
     chatId: string,
     limit?: number,
     includeMedia?: boolean,
     mediaMaxBytes?: number,
+    signal?: AbortSignal,
   ): Promise<IncomingMessage[]>;
 
   // Calls

@@ -27,20 +27,27 @@ export interface Session {
   name: string;
   status:
     | 'created'
-    | 'idle'
     | 'initializing'
-    | 'connecting'
     | 'authenticating'
     | 'qr_ready'
     | 'ready'
     | 'disconnected'
+    | 'action_required'
     | 'failed';
-  phone?: string;
-  pushName?: string;
-  lastActive?: string;
+  /**
+   * Whether the gateway holds a live engine for this session right now. The precondition the
+   * lifecycle routes enforce, and not derivable from `status`: `disconnected` covers both a session
+   * mid automatic-reconnect (engine present, start 400s) and one stopped through stop() (no engine).
+   * Optional only because a dashboard can be served by a gateway that predates the field.
+   */
+  engineLoaded?: boolean;
+  phone?: string | null;
+  pushName?: string | null;
+  lastActive?: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Human-readable reason for the most recent terminal engine failure (set only when status is 'failed'). */
+  /** Human-readable reason carried while the status is 'failed' (terminal failure) or
+   * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal). */
   lastError?: string | null;
 }
 
@@ -565,8 +572,16 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     const error = await response.json().catch(() => ({}));
     // Carry the HTTP status on the Error (message unchanged, so the toast de-dup still matches) so
     // callers can tell apart a permission 403 from a real server 5xx instead of guessing from text.
-    const err = new Error(error.message || `HTTP ${response.status}`) as Error & { status?: number };
+    // Carry the machine `code` too: the gateway's stable codes (SESSION_LOGOUT_INCOMPLETE,
+    // SESSION_NAME_TEARDOWN_PENDING, …) drive specific recovery UI, and a reverse-proxy 502 that
+    // never reached the gateway carries no code at all — that distinction is exactly what the unlink
+    // classifier keys on instead of fragile message heuristics.
+    const err = new Error(error.message || `HTTP ${response.status}`) as Error & {
+      status?: number;
+      code?: string;
+    };
     err.status = response.status;
+    if (typeof error.code === 'string') err.code = error.code;
     throw err;
   }
 
@@ -648,6 +663,7 @@ export const sessionApi = {
   delete: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
   start: (id: string) => request<Session>(`/sessions/${id}/start`, { method: 'POST' }),
   stop: (id: string) => request<Session>(`/sessions/${id}/stop`, { method: 'POST' }),
+  logout: (id: string) => request<Session>(`/sessions/${id}/logout`, { method: 'POST' }),
   forceKill: (id: string) => request<Session>(`/sessions/${id}/force-kill`, { method: 'POST' }),
   getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
   requestPairingCode: (id: string, phoneNumber: string) =>
@@ -1004,14 +1020,26 @@ export const infraApi = {
       tables: Record<string, unknown[]>;
       counts: Record<string, number>;
     }>('/infra/export-data'),
-  importData: (tables: Record<string, unknown[]>) =>
-    request<{ imported: boolean; counts?: Record<string, number>; message?: string; warnings?: string[] }>(
-      '/infra/import-data',
-      {
-        method: 'POST',
-        body: JSON.stringify({ tables }),
-      },
-    ),
+  // 200 contract includes the orphan-engine reconciliation result (restartRequired / notices /
+  // stopped+failed ids). A 409 (live engines exist for sessions the backup would remove; the error
+  // message lists them) is retried by the caller with stopOrphans=true, which stops those engines
+  // inside the request. force is deliberately NOT exposed: it leaves the engines writing into the
+  // restored tables until a restart — the window stopOrphans exists to close.
+  importData: (tables: Record<string, unknown[]>, options?: { stopOrphans?: boolean }) =>
+    request<{
+      imported: boolean;
+      counts?: Record<string, number>;
+      message?: string;
+      warnings?: string[];
+      notices?: string[];
+      restartRequired?: boolean;
+      orphanedEngines?: string[];
+      stoppedOrphanEngines?: string[];
+      failedOrphanEngines?: string[];
+    }>('/infra/import-data', {
+      method: 'POST',
+      body: JSON.stringify({ tables, ...options }),
+    }),
 };
 
 // =============================================================================

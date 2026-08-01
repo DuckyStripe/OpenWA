@@ -1,13 +1,15 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, HttpException, NotFoundException } from '@nestjs/common';
 import { GroupService } from './group.service';
-import { SessionService } from '../session/session.service';
+import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 
 describe('GroupService', () => {
   const makeService = (engine: Partial<IWhatsAppEngine> | undefined) => {
-    const sessionService = { getEngine: jest.fn().mockReturnValue(engine) } as unknown as SessionService;
-    return new GroupService(sessionService);
+    const engines = new EngineRegistry();
+    if (engine) engines.set('s1', engine as IWhatsAppEngine);
+    return new GroupService(engines);
   };
 
   it('throws 400 "Session is not started" when the engine is missing (guard preserved)', () => {
@@ -148,6 +150,38 @@ describe('GroupService', () => {
       ).rejects.toBeInstanceOf(EngineNotSupportedError);
       expect(engine.setGroupMessagesAdminsOnly).not.toHaveBeenCalled();
       expect(engine.setGroupInfoAdminsOnly).not.toHaveBeenCalled();
+    });
+
+    it('names the failed field AND the applied ones when a patch partially applies', async () => {
+      // ephemeralSeconds applied, then announce failed: the client must learn the group is now in a
+      // mixed state (and which subset took effect), not receive a bare engine error.
+      const engine = {
+        setGroupEphemeral: jest.fn().mockResolvedValue(undefined),
+        setGroupMessagesAdminsOnly: jest.fn().mockRejectedValue(new EngineRefusedError('not a group admin')),
+        setGroupInfoAdminsOnly: jest.fn().mockResolvedValue(undefined),
+      };
+      const svc = makeService(engine);
+      const error = await svc
+        .updateGroupSettings('s1', 'g1', { announce: true, locked: true, ephemeralSeconds: 86400 })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(HttpException);
+      expect((error as HttpException).getStatus()).toBe(403); // the underlying refusal's status survives
+      expect((error as HttpException).message).toContain("'announce' failed");
+      expect((error as HttpException).message).toContain('ephemeralSeconds');
+      // The patch stops at the failure: locked is never attempted.
+      expect(engine.setGroupInfoAdminsOnly).not.toHaveBeenCalled();
+    });
+
+    it('propagates a first-field failure unchanged (nothing applied → no partial state to report)', async () => {
+      const engine = {
+        setGroupEphemeral: jest.fn().mockRejectedValue(new EngineRefusedError('not a group admin')),
+        setGroupMessagesAdminsOnly: jest.fn().mockResolvedValue(undefined),
+      };
+      const svc = makeService(engine);
+      await expect(
+        svc.updateGroupSettings('s1', 'g1', { announce: true, ephemeralSeconds: 86400 }),
+      ).rejects.toBeInstanceOf(EngineRefusedError);
+      expect(engine.setGroupMessagesAdminsOnly).not.toHaveBeenCalled();
     });
   });
 });
