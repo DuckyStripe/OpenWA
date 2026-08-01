@@ -76,7 +76,7 @@ List endpoints return a bare array (some paginated list routes instead return a 
 ]
 ```
 
-Session `status` wire values are **lowercase**: `created | initializing | qr_ready | authenticating | ready | disconnected | failed`.
+Session `status` wire values are **lowercase**: `created | initializing | qr_ready | authenticating | ready | disconnected | action_required | failed`.
 
 ### Error Response
 
@@ -100,7 +100,7 @@ Validation failures (`statusCode: 400`) return `message` as an **array** of fiel
 | `401` | Unauthorized | Missing/invalid/expired/revoked `X-API-Key` (or `METRICS_TOKEN` for metrics), a blocked source IP, or a key used outside its `allowedSessions` scope |
 | `403` | Forbidden | A valid, in-scope key whose **role** is below the route's `@RequireRole` requirement |
 | `404` | Not Found | The addressed resource (session, message, webhook, batch, …) does not exist |
-| `409` | Conflict | A uniqueness constraint was violated (e.g. duplicate name) |
+| `409` | Conflict | A uniqueness constraint was violated (e.g. duplicate name), or a credential teardown for the same session name is still in flight on `start`/`delete` (retryable; body carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`) |
 | `413` | Payload Too Large | Base64 media exceeds the media byte cap (see §6.3) |
 | `500` | Internal Server Error | Send failed at the WhatsApp engine or an unexpected server error |
 
@@ -128,6 +128,8 @@ All media send routes (`send-image`, `send-video`, `send-audio`, `send-document`
 | `mentions` | string[] | no | array of WIDs | WIDs to @mention in the caption (e.g. `["62811@c.us"]`). See **Mentions** below |
 
 Provide **exactly one** of `url` or `base64`. Omitting both, or supplying `base64` without `mimetype`, returns `400`.
+
+A document sent without a `filename` is delivered under the default name `file` — on the whatsapp-web.js engine, a URL-based send first derives the URL basename before that fallback applies.
 
 ```json
 {
@@ -184,7 +186,7 @@ Every path below is prefixed with `/api`. Unless marked **public**, send `X-API-
 
 ### 6.4.1 Sessions
 
-Base path `/api/sessions`. All routes that return a session return data shaped by `SessionResponseDto.fromEntity` (via `transformSession`), which **strips** `config`, `proxyUrl`, and `proxyType` and renames the entity field `lastActiveAt` to `lastActive`. Session `status` wire values are lowercase: `created | initializing | qr_ready | authenticating | ready | disconnected | failed`.
+Base path `/api/sessions`. All routes that return a session return data shaped by `SessionResponseDto.fromEntity` (via `transformSession`), which **strips** `config`, `proxyUrl`, and `proxyType` and renames the entity field `lastActiveAt` to `lastActive`. Session `status` wire values are lowercase: `created | initializing | qr_ready | authenticating | ready | disconnected | action_required | failed`.
 
 #### GET /api/sessions
 
@@ -213,12 +215,15 @@ List all sessions, scoped to the API key's `allowedSessions`, ordered `createdAt
     "lastActive": "2026-06-25T09:01:55.000Z",
     "createdAt": "2026-06-20T11:30:00.000Z",
     "updatedAt": "2026-06-25T09:01:55.000Z",
-    "lastError": null
+    "lastError": null,
+    "engineLoaded": true
   }
 ]
 ```
 
-`lastError` is non-null only when `status` is `failed`. `config`/`proxyUrl`/`proxyType` are not present (stripped by `fromEntity`).
+`lastError` is non-null only when `status` is `failed` or `action_required`; any other status clears it. `config`/`proxyUrl`/`proxyType` are not present (stripped by `fromEntity`).
+
+`engineLoaded` reports whether the gateway holds a live engine for the session at the moment of the response. It is the precondition the lifecycle routes enforce, and **`status` is not a substitute for it**: `disconnected` covers both a session whose engine is still registered while an automatic reconnect backs off — where `POST /start` answers `400` — and one stopped through `POST /stop`, which has no engine and does need a start. When `engineLoaded` is `true`, `stop`, `logout` and `force-kill` can act; when it is `false`, `start` is the applicable route. The field is derived per request from live process state, so it is never persisted and never appears in historical/exported data.
 
 **Errors:** `401` missing/invalid `X-API-Key`
 
@@ -247,7 +252,8 @@ Get a single session by ID.
   "lastActive": "2026-06-25T09:01:55.000Z",
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:01:55.000Z",
-  "lastError": null
+  "lastError": null,
+  "engineLoaded": true
 }
 ```
 
@@ -375,7 +381,7 @@ Get session statistics for multi-session monitoring.
 
 Create a new WhatsApp session.
 
-**Auth:** API key (OPERATOR)
+**Auth:** API key (OPERATOR) that is not restricted to specific sessions. Creating a session is a deployment-level act: the new session is outside the caller's `allowedSessions` by construction, so a session-scoped key is rejected with `403` (`@RequireUnscopedKey`). An unscoped OPERATOR/ADMIN key may create a session.
 
 **Request body** — `CreateSessionDto`
 
@@ -424,7 +430,8 @@ network cannot reach WhatsApp directly. Set `proxyUrl`/`proxyType` on the same r
   "lastActive": null,
   "createdAt": "2026-06-25T09:00:00.000Z",
   "updatedAt": "2026-06-25T09:00:00.000Z",
-  "lastError": null
+  "lastError": null,
+  "engineLoaded": false
 }
 ```
 
@@ -459,13 +466,14 @@ No request body.
   "lastActive": null,
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:05:00.000Z",
-  "lastError": null
+  "lastError": null,
+  "engineLoaded": true
 }
 ```
 
 Returned via `transformSession`. Status typically transitions to `initializing` / `qr_ready`.
 
-**Errors:** `400` session already started / already starting · `401` · `403` · `404` not found
+**Errors:** `400` session already started / already starting · `401` · `403` · `404` not found · `409` credential teardown for the same session name still in flight (retryable; body carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`; no destructive side effect runs before the refusal — a retry after cleanup settles proceeds)
 
 #### POST /api/sessions/:id/stop
 
@@ -494,13 +502,83 @@ No request body.
   "lastActive": "2026-06-25T09:01:55.000Z",
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:10:00.000Z",
-  "lastError": null
+  "lastError": null,
+  "engineLoaded": false
 }
 ```
 
 Returned via `transformSession`; status typically becomes `disconnected`.
 
 **Errors:** `401` · `403` · `404` not found
+
+#### POST /api/sessions/:id/logout
+
+Attempt an engine-native unlink of this companion device, then tear the session down locally.
+
+`stop` disconnects while keeping the stored credentials, and `delete` additionally purges the
+on-disk auth directories and the session row, but neither tells WhatsApp anything: the device stays
+listed under the account holder's **Linked Devices** on the phone until they remove it by hand.
+`logout` attempts the engine-native unlink operation itself.
+
+A `200` means the engine-native unlink operation **and** the required local credential cleanup both
+completed — for Baileys, a valid companion identity, an acknowledged `remove-companion-device` IQ
+response, and removal of the on-disk auth dir; for whatsapp-web.js, the native `Client.logout()`
+promise (including `LocalAuth.logout()`) settled. `200` is **not** an independent observation that
+the handset UI no longer shows the linked device — only the linked device itself can observe that,
+and callers must not claim otherwise. Because a completed unlink wipes the stored credentials, a
+later `start` always requires a fresh QR scan or pairing code.
+
+The session must be running — the unlink is a network round-trip that needs a live engine, so a
+stopped session is rejected with `400` (the row is left untouched) rather than reported as a success
+that never reached WhatsApp.
+
+If the engine-backed logout attempt does not complete, the session is still torn down locally
+(map reconciled, status `disconnected`) but the route returns `502` with a stable
+`code: 'SESSION_LOGOUT_INCOMPLETE'`: no send / no acknowledgement / timeout or transport error / or
+a local-cleanup failure. `phone` is cleared on this path and **no** `session_logged_out` audit row
+is written (that audit is only written on the `200` path). Start the session again and retry the
+logout. Do not assume the retry reconnects automatically or lands in a guaranteed QR state — whether
+the old credentials remain usable depends on where the failure happened, and the route does not
+report which.
+
+With `AUTO_START_SESSIONS=true`, auto-start selects sessions whose `phone` is non-null. Both a `200`
+and a `502` logout clear `phone`, so neither is auto-started on boot — an incomplete-logout (`502`)
+session must be started explicitly and the logout retried by hand. A session that must stay down can
+simply be left as-is.
+
+**Auth:** API key (OPERATOR)  ·  **Scope:** session-scoped
+
+**Path parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `id` | string | Session UUID |
+
+No request body.
+
+**Response** `200`
+
+```json
+{
+  "id": "8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a",
+  "name": "my-bot",
+  "status": "disconnected",
+  "phone": null,
+  "pushName": null,
+  "connectedAt": null,
+  "lastActive": "2026-06-25T09:01:55.000Z",
+  "createdAt": "2026-06-20T11:30:00.000Z",
+  "updatedAt": "2026-06-25T09:11:00.000Z",
+  "lastError": null,
+  "engineLoaded": false
+}
+```
+
+Returned via `transformSession`; status becomes `disconnected` and `phone` is cleared (so the boot
+auto-start does not resurrect the session). Recorded in the audit log as `session_logged_out`,
+distinguishing an intentional unlink from a plain stop.
+
+**Errors:** `400` session is not started (no engine to send through; the row is left untouched) · `401` · `403` · `404` not found · `502` `SESSION_LOGOUT_INCOMPLETE` — session stopped locally but the logout operation did not complete (retryable; `phone` cleared, no success audit)
 
 #### POST /api/sessions/:id/force-kill
 
@@ -529,13 +607,14 @@ No request body.
   "lastActive": "2026-06-25T09:01:55.000Z",
   "createdAt": "2026-06-20T11:30:00.000Z",
   "updatedAt": "2026-06-25T09:12:00.000Z",
-  "lastError": null
+  "lastError": null,
+  "engineLoaded": false
 }
 ```
 
 Returned via `transformSession`.
 
-**Errors:** `401` · `403` · `404` not found
+**Errors:** `400` session is not started (no live engine to kill) · `401` · `403` · `404` not found
 
 #### POST /api/sessions/:id/pairing-code
 
@@ -712,7 +791,7 @@ Delete a session.
 
 **Response** `204` — empty body (`@HttpCode(204)`, returns void). A `findOne` lookup runs first, so a missing id yields `404`.
 
-**Errors:** `401` missing/invalid key, or key not scoped to this session · `403` key role below OPERATOR · `404` session not found
+**Errors:** `401` missing/invalid key, or key not scoped to this session · `403` key role below OPERATOR · `404` session not found · `409` credential teardown for the same session name still in flight (retryable; body carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`; on a `409` the row is **not** deleted and no hook/auth-purge runs — retry after cleanup settles)
 
 ### 6.4.2 Messages
 
@@ -1072,6 +1151,8 @@ Send a document/file (by URL or base64). Uses `SendMediaMessageDto`; `filename` 
 ```json
 { "messageId": "true_628123456789@c.us_3EB0ABCD", "timestamp": 1719312000 }
 ```
+
+**Engine differences:** Baileys always sends a document as a document, while whatsapp-web.js deliberately keeps normal mimetype classification for `status@broadcast` and broadcast lists — the library returns `null` for document-mode sends to those recipients, so forcing the flag there would turn a working send into a failure. For URL-based sends without an explicit `filename`, whatsapp-web.js derives the URL basename; Baileys falls back to the literal `file`.
 
 **Errors:** `400` media validation failure / session not active / unknown body field · `401` missing/invalid API key · `403` key role below OPERATOR · `500` engine error
 
@@ -3780,7 +3861,7 @@ Values come from `StatsService.getOverview()` plus `process.memoryUsage()`/`proc
 
 Get overall cross-session aggregate statistics (sessions by status + message totals + today's counts).
 
-**Auth:** API key (ADMIN) — deliberately ADMIN-only (global cross-tenant aggregate).
+**Auth:** API key (ADMIN) that is not restricted to specific sessions — a global cross-tenant aggregate, so a session-scoped key has no claim on it and is rejected with `403` (`@RequireUnscopedKey`).
 
 **Response** `200`
 
@@ -3802,13 +3883,13 @@ Get overall cross-session aggregate statistics (sessions by status + message tot
 
 Notes: raw handler return (no envelope). `sessions.byStatus` is keyed by the stored `SessionStatus` values — lowercase, per §6.4.1 — with per-status counts; `sessions.active` counts only `ready`. `messages.sent`/`received` are all-time outgoing/incoming COUNTs; `failed` is the `FAILED`-status COUNT; `today.*` are the same counts since local midnight. Side effect: caches the `sessions` block via `CacheService`.
 
-**Errors:** `401` — missing/invalid `X-API-Key` · `403` — key role below `ADMIN`.
+**Errors:** `401` — missing/invalid `X-API-Key` · `403` — key role below `ADMIN`, or the key is session-restricted.
 
 #### GET /api/stats/messages
 
 Get message statistics over a period: time series, counts by type, by session, and top chats.
 
-**Auth:** API key (ADMIN) — cross-session aggregate.
+**Auth:** API key (ADMIN) that is not restricted to specific sessions — a cross-session aggregate, so a session-scoped key is rejected with `403` (`@RequireUnscopedKey`).
 
 **Query parameters**
 
@@ -3836,7 +3917,7 @@ Get message statistics over a period: time series, counts by type, by session, a
 
 Notes: raw handler return. `timeSeries.timestamp` is a DB-formatted bucket string — hourly `YYYY-MM-DD HH:00:00` for `24h`, daily `YYYY-MM-DD` for `7d`/`30d` — sorted ascending. `byType` keys are message-type strings (a null type becomes `unknown`). `bySession.name` is `Unknown` when the session is not found. `topChats` is the top 10 by `messageCount` DESC. All counts are numbers.
 
-**Errors:** `400` — `period` not in the enum, or any non-whitelisted query field (strict `whitelist` + `forbidNonWhitelisted`) · `401` — missing/invalid API key · `403` — role below `ADMIN`.
+**Errors:** `400` — `period` not in the enum, or any non-whitelisted query field (strict `whitelist` + `forbidNonWhitelisted`) · `401` — missing/invalid API key · `403` — role below `ADMIN`, or the key is session-restricted.
 
 #### GET /api/stats/sessions/:sessionId
 
@@ -3874,7 +3955,7 @@ Notes: raw handler return. `session.status` is the `SessionStatus` enum value. `
 
 Get application settings (environment-derived; `general`/`api`/`notifications` groups).
 
-**Auth:** API key (ADMIN). Settings expose server configuration, so a key below `ADMIN` is rejected with `403`. The route carries no session dimension and is not fenced with `@RequireUnscopedKey`, so a session-scoped ADMIN key is accepted.
+**Auth:** API key (ADMIN) that is not restricted to specific sessions. Settings describe the whole deployment, so the route requires an unrestricted key (`@RequireUnscopedKey`): the role check alone does not exclude a key confined to a subset of sessions, which has no claim on deployment-wide configuration, so a session-scoped ADMIN key is rejected with `403`. A key below `ADMIN` is also rejected with `403`.
 
 **Response** `200`
 
@@ -3900,7 +3981,7 @@ Get application settings (environment-derived; `general`/`api`/`notifications` g
 
 Notes: raw return of an in-memory `Settings` object built once in the controller constructor from `ConfigService` (snapshotted at construction, not re-read per request). `api.rateLimitWindow` is in ms. `enableDocs` reflects the `ENABLE_SWAGGER` gate (enabled by default outside production; disabled by default in production unless explicitly enabled). Only `notifications.*` is currently hardcoded (`emailEnabled: false`, `notificationEmail: ''`, `webhookAlerts: true`).
 
-**Errors:** `401` — missing/invalid `X-API-Key` · `403` — API key lacks the ADMIN role.
+**Errors:** `401` — missing/invalid `X-API-Key` · `403` — API key lacks the ADMIN role, or the key is session-restricted.
 
 #### PUT /api/settings
 
@@ -4290,6 +4371,8 @@ Replace all Data DB rows with the supplied export. **Destructive and transaction
 
 **Orphan-engine pre-flight.** Before the transaction opens, any running engine whose session id is absent from `tables.sessions` is an orphan (the replace would delete its DB row, leaving an unstoppable engine writing into freshly restored tables). Default behaviour is to refuse with `409` listing those ids; `stopOrphans: true` stops them in-request and proceeds; `force: true` proceeds and leaves them running until restart.
 
+Because that pre-flight runs *before* the transaction, its teardown is not covered by the rollback. A response with `imported:false` therefore still reports the engines it really stopped, and `restartRequired` on that path means only that a teardown **failed** — a cleanly stopped orphan leaves its session row intact (restart it with `POST /sessions/{id}/start`), and an engine `force` left running was never orphaned after all, since the data that would have orphaned it was not replaced.
+
 Inside the transaction every migration table is emptied. `webhooks` and `sessions` are DELETEd directly, so a missing table there fails the restore; the other 11 go through a tolerant helper where a *genuinely missing* table is skipped. Any other DELETE failure propagates to the rollback. Rows are then re-inserted, sessions first. JSON object/array fields are auto-stringified before insert, and the Postgres-form `$N` placeholders are rewritten for SQLite. Two guards return `imported:false` after a rollback: any `warnings`, and a payload that restores **zero** rows in total (a wrong/empty backup would otherwise commit a silent wipe — the response then carries `Backup contained no rows to restore; refused to replace existing data. Check the file.`). On commit the lid→phone mirror is reloaded from the restored rows.
 
 **Errors:** `401` · `403` · `409` live engines exist for sessions the backup does not contain (retry with `stopOrphans` or `force`) · `500` `tables` missing/null or unrecoverable DB error
@@ -4503,7 +4586,7 @@ Install a plugin from an uploaded `.zip` package.
 
 #### POST /api/plugins/install-url
 
-Install a plugin by downloading its `.zip` from an HTTPS URL (SSRF-guarded fetch: host validated, redirects refused, size-capped at `plugins.downloadMaxBytes`, default 5 MB). Plain `http://` is rejected — the package is executable code and must be integrity-protected in transit; private-network targets remain subject to the SSRF guard.
+Install a plugin by downloading its `.zip` from an HTTPS URL (SSRF-guarded fetch: host validated, redirects followed with every hop re-validated through the guard and the chain capped at 5 hops, size-capped at `plugins.downloadMaxBytes`, default 5 MB). Plain `http://` is rejected — the package is executable code and must be integrity-protected in transit; private-network targets remain subject to the SSRF guard. A redirect hop that downgrades back to plain `http://` mid-chain is likewise refused (set `PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS=true` only if your vendor genuinely redirects that way); a chain over the cap fails with an explicit "too many redirects" error.
 
 Optional content pinning: append `#sha256=<64 hex>` (URL fragment — never sent to the server) to require the downloaded bytes to match that digest; the fragment is the only honored marker — query params are deliberately ignored. A mismatch or a malformed marker fails the install closed; no marker means no verification (HTTPS + the SSRF guard are the baseline).
 
@@ -4640,9 +4723,9 @@ Set (or clear) a plugin config override for a specific session.
 
 #### PUT /api/plugins/:id/sessions
 
-Set which sessions a session-scoped plugin is activated for.
+Set which sessions a session-scoped plugin is activated for. This is a **full replacement** of the plugin's global activation set: the supplied `sessions` array overwrites `activeSessions` in its entirety (not a merge), so an omitted session is deactivated and `[]` deactivates the plugin for every session.
 
-**Auth:** API key (ADMIN)  ·  **Scope:** session-scoped (the key's `allowedSessions` is enforced)
+**Auth:** API key (ADMIN) that is **not restricted to specific sessions** (`@RequireUnscopedKey`). Because the route replaces the whole activation set, a session-scoped key is rejected with `403` whatever it sends — even a request confined to its own `allowedSessions` would silently delete every other session's activation, so the fence refuses scoped keys before the handler runs. Use an unrestricted ADMIN key. (The per-session config override route `PUT /api/plugins/:id/config/:sessionId` is a different operation and stays scoped to the addressed session.)
 
 **Path parameters**
 
@@ -4662,9 +4745,7 @@ Set which sessions a session-scoped plugin is activated for.
 
 **Response** `200` — the updated `PluginDto` (reflecting the new `activeSessions`).
 
-A session-restricted key requesting `"*"` or out-of-scope sessions gets `403 API key not authorized for session(s): …`.
-
-**Errors:** `400` plugin is global · `401` · `403` key not authorized for requested sessions · `404` unknown id
+**Errors:** `400` plugin is global · `401` · `403` key is session-scoped (full activation replacement requires an unrestricted key) · `404` unknown id
 
 ---
 
@@ -5080,9 +5161,9 @@ These are the events OpenWA actually emits. A webhook is registered with an `eve
 | `message.edited` | A message body or media caption is edited | `{ messageId, chatId, body, senderId, from, to, fromMe, isGroup, type, hasMedia, author?, mentionedIds?, timestamp }` — `messageId` is the original message id, `body` is the latest text/caption, and `timestamp` is the edit occurrence time in epoch **seconds** (not the original creation time) |
 | `session.qr` | A new pairing QR is generated | `{ sessionId, qr }` (raw QR string) |
 | `session.authenticated` | The session pairs and becomes ready | `{ sessionId, phone, pushName }` |
-| `session.disconnected` | The session disconnects | `{ sessionId, reason }` |
+| `session.disconnected` | The session disconnects on the engine or WhatsApp side (drop, conflict, or a phone-initiated unlink). Not fired for API-initiated stop/logout/delete — those are acknowledged by the API response and the `session.status` transition | `{ sessionId, reason }` |
 | `session.reconnect_loop` | Every 5th consecutive reconnect attempt is scheduled (attempt 5, 10, 15, …) — the session is failing to come back up | `{ sessionId, attempts, nextDelayMs }` |
-| `session.status` | The session status transitions | `{ sessionId, status }` where `status` is one of `created` / `initializing` / `qr_ready` / `authenticating` / `ready` / `disconnected` / `failed` |
+| `session.status` | The session status transitions | `{ sessionId, status }` where `status` is one of `created` / `initializing` / `qr_ready` / `authenticating` / `ready` / `disconnected` / `action_required` / `failed` |
 | `group.join` | Participant(s) are added to or join a group this session is in | `{ groupId, actorId?, participantIds, timestamp }` — `actorId` is the admin/inviter when known |
 | `group.leave` | Participant(s) leave or are removed from a group | `{ groupId, actorId?, participantIds, timestamp }` |
 | `group.update` | Group metadata changes (subject, description, announce/locked settings) | `{ groupId, actorId?, participantIds, changes?, timestamp }` — `changes` carries only the fields that changed: `subject?`, `description?`, `announce?`, `locked?` |

@@ -136,9 +136,24 @@ curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/stop" \
   -H "X-API-Key: $API_KEY"
 ```
 
+#### POST /api/sessions/:id/logout
+
+Attempt an engine-native unlink of this device, then stop the session (OPERATOR). Requires a running
+session. A `200` means the unlink operation AND the required local cleanup completed — it is not an
+independent observation that the handset UI no longer shows the linked device, and a later start
+needs a fresh QR scan or pairing code. A `502` carries `code: 'SESSION_LOGOUT_INCOMPLETE'`: the
+session was stopped locally but the logout operation did not complete (no send / no acknowledgement
+/ timeout or transport error / local-cleanup failure); `phone` is cleared and no success audit is
+written, so start the session again and retry.
+
+```bash
+curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/logout" \
+  -H "X-API-Key: $API_KEY"
+```
+
 #### POST /api/sessions/:id/force-kill
 
-Force-kill a stuck session (OPERATOR).
+Force-kill a stuck session (OPERATOR). Returns `400` when the session is not started (there is no live engine to kill).
 
 ```bash
 curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/force-kill" \

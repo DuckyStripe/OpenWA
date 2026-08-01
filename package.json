@@ -1,6 +1,6 @@
 {
   "name": "openwa",
-  "version": "0.11.1",
+  "version": "0.12.1",
   "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API for WhatsApp",
   "author": "Yudhi Armyndharis & OpenWA Contributors",
   "private": true,
@@ -63,7 +63,7 @@
     "@bull-board/api": "^8.3.0",
     "@bull-board/express": "^8.3.0",
     "@bull-board/nestjs": "^8.3.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@nestjs/bullmq": "^11.0.4",
     "@nestjs/common": "^11.1.28",
     "@nestjs/config": "^4.0.2",

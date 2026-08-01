@@ -295,20 +295,30 @@ stateDiagram-v2
     authenticating --> ready: Auth success
     authenticating --> failed: Auth failed
     ready --> disconnected: Connection lost
+    ready --> action_required: Needs an operator
+    action_required --> disconnected: stop() / logout()
     disconnected --> initializing: reconnect()
     ready --> [*]: DELETE
     failed --> [*]: DELETE
 ```
 
-| Status           | Description                  |
-| ---------------- | ---------------------------- |
-| `created`        | Session created, not started |
-| `initializing`   | Starting browser & WhatsApp  |
-| `qr_ready`       | QR code ready for scanning   |
-| `authenticating` | QR scanned, authenticating   |
-| `ready`          | Connected and ready          |
-| `disconnected`   | Disconnected, can reconnect  |
-| `failed`         | Failed, needs recreation     |
+| Status            | Description                                                       |
+| ----------------- | ----------------------------------------------------------------- |
+| `created`         | Session created, not started                                      |
+| `initializing`    | Starting browser & WhatsApp                                       |
+| `qr_ready`        | QR code ready for scanning                                        |
+| `authenticating`  | QR scanned, authenticating                                        |
+| `ready`           | Connected and ready                                               |
+| `disconnected`    | Disconnected, can reconnect                                       |
+| `action_required` | Engine running, but it needs an operator before it can work again |
+| `failed`          | Failed, needs recreation                                          |
+
+`action_required` differs from `failed` in that the engine is still loaded and still holds its
+WhatsApp connection — nothing is broken, but something outside the gateway has to change before the
+session is usable. The reason is carried on `lastError`, and every engine-backed action (`stop`,
+`logout`) still applies; sending is refused until the session returns to `ready`. Reaching it always
+takes deliberate evidence, never a single failed probe, precisely because it stops sends. A restart
+clears it, and so does a gateway restart.
 
 **Config Schema:**
 
@@ -494,7 +504,8 @@ CREATE INDEX "IDX_audit_logs_createdAt" ON audit_logs(created_at);
 **Audit actions** are an enum (`AuditAction`) spanning API-key lifecycle (`api_key_created`,
 `api_key_updated`, `api_key_used`, `api_key_revoked`, `api_key_deleted`, `api_key_auth_failed`), session
 lifecycle (`session_created`, `session_started`, `session_stopped`, `session_force_killed`,
-`session_deleted`, `session_qr_generated`, `session_connected`, `session_disconnected`), messages
+`session_logged_out`, `session_deleted`, `session_qr_generated`, `session_connected`,
+`session_disconnected`), messages
 (`message_sent`, `message_failed`), webhooks (`webhook_created`, `webhook_deleted`,
 `webhook_triggered`, `webhook_failed`), rate-limit enforcement (`rate_limit_exceeded`, sampled to at
 most one row per subject+kind per minute), the queue dashboard (`queue_board_mutated`), integration

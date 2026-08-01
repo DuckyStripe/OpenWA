@@ -20,7 +20,7 @@ import { QUEUE_NAMES } from '../queue/queue-names';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { Public, RequireRole } from '../auth/decorators/auth.decorators';
+import { Public, RequireRole, RequireUnscopedKey } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 import { isPathWithin, isSafeSessionName } from '../../common/utils/path-safety';
 import { writeSecretFile } from '../../common/utils/secret-file';
@@ -43,7 +43,7 @@ import { BLANK_SHADOWED_ENV_KEYS, isOsProvidedEnv } from '../../config/env-prece
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
-import * as dotenv from 'dotenv';
+import { generatedEnvPath, readGeneratedEnv } from './generated-env';
 
 interface InfraStatus {
   // `builtIn` reflects whether OpenWA's own bundled container is actually running and backing this
@@ -337,6 +337,11 @@ interface SavedConfigResponse {
 
 @ApiTags('infrastructure')
 @Controller('infra')
+// Every route here is deployment-global (data export/import, infra config, service orchestration),
+// so the guard's route-param session fence can never bite. Reject session-scoped keys outright at
+// class level, which also covers routes added later. @Public routes are unaffected: the guard
+// returns before it reads this metadata.
+@RequireUnscopedKey()
 export class InfraController implements OnApplicationBootstrap {
   private readonly logger = createLogger('InfraController');
 
@@ -571,10 +576,7 @@ export class InfraController implements OnApplicationBootstrap {
   /** Saved built-in intent flags from data/.env.generated — the fallback when Docker isn't reachable. */
   private readSavedBuiltinFlags(): { database: boolean; cache: boolean; storage: boolean } {
     try {
-      const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
-      const saved: Record<string, string> = fs.existsSync(envPath)
-        ? dotenv.parse(fs.readFileSync(envPath, 'utf8'))
-        : {};
+      const saved = readGeneratedEnv();
       return {
         database: saved.POSTGRES_BUILTIN === 'true',
         cache: saved.REDIS_BUILTIN === 'true',
@@ -606,8 +608,7 @@ export class InfraController implements OnApplicationBootstrap {
   @ApiOperation({ summary: 'Read the saved infrastructure configuration for the dashboard form' })
   @ApiResponse({ status: 200, description: 'Saved configuration (secrets omitted)' })
   getConfig(): SavedConfigResponse {
-    const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
-    const saved: Record<string, string> = fs.existsSync(envPath) ? dotenv.parse(fs.readFileSync(envPath, 'utf8')) : {};
+    const saved = readGeneratedEnv();
 
     // Secrets (passwords, S3 keys) are never returned; the form shows a "set" indicator
     // and an empty submission preserves the stored value (see saveConfig). This lets the
@@ -668,10 +669,8 @@ export class InfraController implements OnApplicationBootstrap {
       // field (`undefined`) leaves its stored key alone — only values actually submitted
       // are written. `existing` below is therefore the base for every key the payload
       // does not mention.
-      const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
-      const existing: Record<string, string> = fs.existsSync(envPath)
-        ? dotenv.parse(fs.readFileSync(envPath, 'utf8'))
-        : {};
+      const envPath = generatedEnvPath();
+      const existing = readGeneratedEnv();
       const updates: Record<string, string> = {};
       // Keys to remove from the merged result — used to drop stale settings when the
       // user switches mode (postgres->sqlite, s3->local, built-in->external) so a reload
@@ -1054,21 +1053,38 @@ export class InfraController implements OnApplicationBootstrap {
         this.logger.log('Teardown result', { removalResult });
       }
 
-      // Then, start containers for enabled services
-      if (profiles.length > 0) {
+      // Then, start containers for enabled services. Start shares the SAME managed allowlist as
+      // teardown above: a non-managed name reaching orchestrateProfiles could, via container-name
+      // matching, select an unrelated host container, so constrain start to the managed profiles too
+      // and drop anything else. (DockerService already hard-prefixes openwa-<service> and filters on
+      // the com.openwa.service label, so this is defense-in-depth, not the sole control.)
+      const toStart = profiles.filter(p => MANAGED_DOCKER_PROFILES.includes(p));
+      const ignoredStart = profiles.filter(p => !MANAGED_DOCKER_PROFILES.includes(p));
+      if (ignoredStart.length > 0) {
+        this.logger.warn('Ignoring non-managed profiles in profiles', { ignoredStart });
+      }
+      if (toStart.length > 0) {
         this.logger.log('Orchestrating enabled profiles...');
-        orchestrationResult = await this.dockerService.orchestrateProfiles(profiles);
+        orchestrationResult = await this.dockerService.orchestrateProfiles(toStart);
         this.logger.log('Orchestration result', { orchestrationResult });
       }
     } else {
       this.logger.warn('Docker not available, writing signal file instead');
-      // Fallback: write signal file for host script
+      // Fallback: write signal file for host script — but apply the SAME managed-profile
+      // constraint as the Docker path above: the external consumer of this file must never be
+      // handed a profile name the in-process path would have refused.
       try {
         const signalFile = path.resolve(process.cwd(), 'data', '.orchestration-request.json');
+        const toStart = profiles.filter(p => MANAGED_DOCKER_PROFILES.includes(p));
+        const toRemove = profilesToRemove.filter(p => !profiles.includes(p) && MANAGED_DOCKER_PROFILES.includes(p));
+        const ignored = [...profiles, ...profilesToRemove].filter(p => !MANAGED_DOCKER_PROFILES.includes(p));
+        if (ignored.length > 0) {
+          this.logger.warn('Ignoring non-managed profiles in the signal-file request', { ignored });
+        }
         const orchestrationRequest = {
           timestamp: new Date().toISOString(),
-          profiles,
-          profilesToRemove,
+          profiles: toStart,
+          profilesToRemove: toRemove,
           action: 'restart-with-profiles',
         };
         fs.writeFileSync(signalFile, JSON.stringify(orchestrationRequest, null, 2), 'utf8');
@@ -1384,6 +1400,23 @@ export class InfraController implements OnApplicationBootstrap {
       // Legacy escape hatch: proceed and leave the engines running until restart.
       restartRequired = true;
     }
+
+    // What the rollback branches below must report about the engines. The transaction can be rolled
+    // back; the orphan teardown above CANNOT — it ran before the transaction opened and those engines
+    // are already destroyed. Reporting empty arrays there would tell an operator nothing happened
+    // while their sessions are down.
+    //
+    // restartRequired narrows to the one thing a rollback cannot undo: a FAILED teardown may have left
+    // a Chromium/socket alive. The two other pre-flight outcomes do not survive the rollback as
+    // restart-worthy — a cleanly stopped orphan leaves its session row intact (restart it through
+    // POST /sessions/:id/start), and an engine the force path left running was never orphaned after
+    // all, because the data it would have been orphaned by is gone.
+    const engineStateAfterRollback = {
+      restartRequired: failedOrphanEngines.length > 0,
+      orphanedEngines,
+      stoppedOrphanEngines,
+      failedOrphanEngines,
+    };
 
     const queryRunner = this.dataDataSource.createQueryRunner();
     await queryRunner.connect();
@@ -1864,10 +1897,7 @@ export class InfraController implements OnApplicationBootstrap {
           counts,
           warnings,
           notices,
-          restartRequired: false,
-          orphanedEngines: [],
-          stoppedOrphanEngines: [],
-          failedOrphanEngines: [],
+          ...engineStateAfterRollback,
         };
       }
 
@@ -1881,10 +1911,7 @@ export class InfraController implements OnApplicationBootstrap {
           counts,
           warnings: ['Backup contained no rows to restore; refused to replace existing data. Check the file.'],
           notices,
-          restartRequired: false,
-          orphanedEngines: [],
-          stoppedOrphanEngines: [],
-          failedOrphanEngines: [],
+          ...engineStateAfterRollback,
         };
       }
 

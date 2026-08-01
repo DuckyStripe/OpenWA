@@ -2114,6 +2114,40 @@ describe('InfraController.requestRestart constrains teardown to managed profiles
     });
     expect(JSON.stringify(result.removal)).not.toContain('removed');
   });
+
+  it('starts only allowlisted profiles, never an unknown entry (symmetry with teardown)', async () => {
+    const orchestrateProfiles = jest.fn().mockResolvedValue({});
+    const controller = buildController({
+      isDockerAvailable: () => true,
+      stopManagedService: jest.fn().mockResolvedValue(true),
+      orchestrateProfiles,
+    });
+
+    // A non-managed name must be dropped before reaching orchestrateProfiles, exactly as teardown
+    // drops it before reaching stopManagedService — so start cannot select an unrelated container.
+    await controller.requestRestart({ profiles: ['postgres', 'not-managed'] });
+
+    expect(orchestrateProfiles).toHaveBeenCalledTimes(1);
+    expect(orchestrateProfiles).toHaveBeenCalledWith(['postgres']);
+  });
+
+  it('writes only allowlisted profiles to the no-Docker signal file (symmetry with the Docker path)', async () => {
+    const writeFileSync = fs.writeFileSync as jest.Mock;
+    writeFileSync.mockClear();
+    const controller = buildController({ isDockerAvailable: () => false });
+
+    // The signal file is consumed by an external host script — it must never be handed a name the
+    // in-process Docker path would have refused.
+    await controller.requestRestart({ profiles: ['postgres', 'not-managed'], profilesToRemove: ['evil', 'redis'] });
+
+    const written = (writeFileSync.mock.calls as Array<[unknown, unknown]>).find(call =>
+      String(call[0]).endsWith('.orchestration-request.json'),
+    );
+    expect(written).toBeDefined();
+    const payload = JSON.parse(String(written![1])) as { profiles: string[]; profilesToRemove: string[] };
+    expect(payload.profiles).toEqual(['postgres']);
+    expect(payload.profilesToRemove).toEqual(['redis']);
+  });
 });
 
 // C002: the infra module exposed sensitive ADMIN operations (credential config write, restart/Docker
@@ -2587,6 +2621,60 @@ describe('InfraController.importData status_updates + runtime reconciliation', (
     expect(res.stoppedOrphanEngines).toEqual(['ghost']);
     expect(res.failedOrphanEngines).toEqual([]);
     expect(res.orphanedEngines).toEqual(['ghost']);
+  });
+
+  it('still reports the engines it already stopped when the import rolls back', async () => {
+    // The pre-flight teardown runs BEFORE the transaction opens and cannot be rolled back with it.
+    // An operator reading imported:false plus empty orphan arrays would conclude nothing happened,
+    // while their sessions are actually down.
+    await seedSession('s1');
+    const stopOrphanEngines = jest.fn().mockResolvedValue({ stopped: ['ghost'], notRunning: [], failed: [] });
+    const controller = build({
+      sessionService: { getActiveSessionIds: () => ['ghost'], stopOrphanEngines },
+    });
+    const dump = await controller.exportData();
+
+    // A message row missing the non-null from/to fails mid-import and forces the all-or-nothing rollback.
+    const res = await controller.importData({
+      tables: {
+        ...dump.tables,
+        messages: [
+          { id: 'mX', sessionId: 's1', chatId: 'c', type: 'text', direction: 'incoming', status: 'sent' },
+        ] as never,
+      },
+      stopOrphans: true,
+    });
+
+    expect(res.imported).toBe(false); // the DB really did roll back
+    expect(stopOrphanEngines).toHaveBeenCalledWith(['ghost']); // ...but the teardown really did happen
+    expect(res.stoppedOrphanEngines).toEqual(['ghost']);
+    expect(res.orphanedEngines).toEqual(['ghost']);
+    expect(res.restartRequired).toBe(false); // sessions survive the rollback; restart them via the API
+  });
+
+  it('flags restartRequired on a rolled-back import whose orphan teardown failed', async () => {
+    // The failed teardown is the one irreversible thing a rollback cannot undo: the Chromium/socket
+    // may still be alive, so this must stay true even though no data changed.
+    await seedSession('s1');
+    const stopOrphanEngines = jest.fn().mockResolvedValue({ stopped: [], notRunning: [], failed: ['ghost'] });
+    const controller = build({
+      sessionService: { getActiveSessionIds: () => ['ghost'], stopOrphanEngines },
+    });
+    const dump = await controller.exportData();
+
+    const res = await controller.importData({
+      tables: {
+        ...dump.tables,
+        messages: [
+          { id: 'mX', sessionId: 's1', chatId: 'c', type: 'text', direction: 'incoming', status: 'sent' },
+        ] as never,
+      },
+      stopOrphans: true,
+    });
+
+    expect(res.imported).toBe(false);
+    expect(res.restartRequired).toBe(true);
+    expect(res.failedOrphanEngines).toEqual(['ghost']);
   });
 
   it('stopOrphans=true surfaces a teardown failure as restartRequired:true + a warning (Map reconciled regardless)', async () => {

@@ -1,5 +1,6 @@
 import * as path from 'path';
-import { resolvePluginMainPath, buildSandboxWorkerEnv, dispatchConversationMedia } from './plugin-loader.service';
+import { resolvePluginMainPath, buildSandboxWorkerEnv } from './plugin-loader.service';
+import { dispatchConversationMedia } from './plugin-capability-context';
 
 /** Regression lock: a plugin's manifest.main must not escape its plugin directory. */
 describe('resolvePluginMainPath', () => {
@@ -115,7 +116,7 @@ describe('dispatchConversationMedia', () => {
 
 import * as fs from 'fs';
 import * as os from 'os';
-import { PluginLoaderService, seedConfigDefaults } from './plugin-loader.service';
+import { PluginLoaderService } from './plugin-loader.service';
 import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
 import { HookManager } from '../hooks';
@@ -580,47 +581,6 @@ describe('PluginLoaderService — loadPlugin seeds configSchema defaults', () =>
   });
 });
 
-describe('seedConfigDefaults', () => {
-  const schema = {
-    type: 'object' as const,
-    properties: {
-      timezone: { type: 'string' as const, default: 'UTC' },
-      cooldownSec: { type: 'number' as const, default: 3600 },
-      schedule: { type: 'object' as const, required: true }, // no default — must stay absent
-      rules: { type: 'array' as const, default: [{ q: 'hi', a: 'hello' }] },
-    },
-  };
-
-  it('seeds schema defaults for absent keys only', () => {
-    const out = seedConfigDefaults(schema, { timezone: 'Asia/Jakarta' });
-    expect(out).toEqual({
-      timezone: 'Asia/Jakarta', // explicit value wins
-      cooldownSec: 3600,
-      rules: [{ q: 'hi', a: 'hello' }],
-    });
-    expect(out).not.toHaveProperty('schedule'); // required-without-default is never invented
-  });
-
-  it('returns the input unchanged when nothing is missing (and no schema)', () => {
-    const config = { timezone: 'UTC', cooldownSec: 1, rules: [] };
-    expect(seedConfigDefaults(schema, config)).toBe(config);
-    expect(seedConfigDefaults(undefined, config)).toBe(config);
-  });
-
-  it('deep-clones object/array defaults so runtime and persisted copies cannot share references', () => {
-    const out = seedConfigDefaults(schema, {});
-    const again = seedConfigDefaults(schema, {});
-    expect(out.rules).toEqual(again.rules);
-    expect(out.rules).not.toBe(again.rules);
-    expect((out.rules as unknown[])[0]).not.toBe((again.rules as unknown[])[0]);
-  });
-
-  it('null is an explicit value and is not overwritten by the default', () => {
-    const out = seedConfigDefaults(schema, { timezone: null });
-    expect(out.timezone).toBeNull();
-  });
-});
-
 describe('PluginLoaderService — enable concurrency', () => {
   let tmpDir: string;
   let loader: PluginLoaderService;
@@ -816,20 +776,8 @@ describe('PluginLoaderService — search-provider wiring', () => {
     } as unknown as ModuleRef);
   }
 
-  it('getSearchRegistry returns the registry when ModuleRef has it', () => {
-    const registry = new SearchProviderRegistry();
-    const loader = makeLoader(jest.fn().mockReturnValue(registry));
-    expect((loader as unknown as { getSearchRegistry: () => unknown }).getSearchRegistry()).toBe(registry);
-  });
-
-  it('getSearchRegistry returns undefined when ModuleRef has no registry (search disabled)', () => {
-    const loader = makeLoader(
-      jest.fn().mockImplementation(() => {
-        throw new Error('not found');
-      }),
-    );
-    expect((loader as unknown as { getSearchRegistry: () => unknown }).getSearchRegistry()).toBeUndefined();
-  });
+  // getSearchRegistry's own behaviour now lives in plugin-host-services.spec.ts, tested on the class
+  // that owns it instead of through a private reach-in on the loader.
 
   it('disablePlugin unregisters the plugin’s search-provider entry', async () => {
     const registry = new SearchProviderRegistry();
@@ -979,7 +927,15 @@ describe('PluginLoaderService — search-provider worker-crash fallback', () => 
     fs.mkdirSync(path.join(tmpDir, 'ok'), { recursive: true });
     fs.writeFileSync(
       path.join(tmpDir, 'ok', 'manifest.json'),
-      JSON.stringify({ id: 'ok', name: 'OK', version: '1.0.0', type: 'extension', main: 'index.cjs' }),
+      JSON.stringify({
+        id: 'ok',
+        name: 'OK',
+        version: '1.0.0',
+        type: 'extension',
+        main: 'index.cjs',
+        // This suite is about crash fallback, so the fixture must be a plugin the search bridge accepts.
+        permissions: ['search:provide'],
+      }),
     );
     fs.writeFileSync(
       path.join(tmpDir, 'ok', 'index.cjs'),
@@ -1011,6 +967,38 @@ describe('PluginLoaderService — search-provider worker-crash fallback', () => 
 
     expect(registry.list().map(p => p.id)).not.toContain('plugin:ok');
     expect(registry.active()?.id).toBe('builtin-fts'); // fell back, not pinned to the dead plugin
+  });
+
+  it('never activates a plugin that registers a search provider without declaring search:provide', async () => {
+    // Same fixture, permission removed: ctx.registerSearchProvider is installed in EVERY worker context,
+    // so this is the whole distance between an undeclared plugin and serving every /search query.
+    fs.writeFileSync(
+      path.join(tmpDir, 'ok', 'manifest.json'),
+      JSON.stringify({ id: 'ok', name: 'OK', version: '1.0.0', type: 'extension', main: 'index.cjs' }),
+    );
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'builtin-fts', label: 'b', search: jest.fn(), health: jest.fn() });
+    const config = {
+      get: (k: string) =>
+        k === 'search.provider' ? 'auto' : k === 'plugins.dir' || k === 'dataDir' ? tmpDir : undefined,
+    } as unknown as ConfigService;
+    const storage = new PluginStorageService(config);
+    const loader = new CapturingLoader(config, new HookManager(), storage, {
+      get: () => registry,
+    } as unknown as ModuleRef);
+
+    loader.loadPlugin(path.join(tmpDir, 'ok'));
+    await loader.enablePlugin('ok');
+
+    // Assert BEFORE reaping: terminate() runs onWorkerExit -> unregisterPluginSearchProvider, which
+    // drops plugin:ok and restores builtin-fts on its own. Asserting after it would pass whether or
+    // not the permission gate works at all. The finally still reaps, so no worker handle leaks.
+    try {
+      expect(registry.list().map(p => p.id)).not.toContain('plugin:ok');
+      expect(registry.active()?.id).toBe('builtin-fts'); // auto mode must NOT hand the gateway to it
+    } finally {
+      await loader.lastHost!.terminate();
+    }
   });
 });
 
