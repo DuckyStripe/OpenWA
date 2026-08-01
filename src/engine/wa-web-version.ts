@@ -133,7 +133,8 @@ export async function resolveWebVersionPin(fetcher: typeof fetch = fetch): Promi
   }
   if (lc === 'off') return undefined; // explicit escape hatch → native auto-select
   const current = await resolveCurrentWebVersion(fetcher);
-  return current ? buildRemotePin(current) : undefined;
+  if (current) return buildRemotePin(current);
+  return undefined; // registry fetch failed → native auto-select
 }
 
 /**
@@ -145,6 +146,7 @@ export function getEffectiveWebVersionInfo(): { version: string | null; source: 
   const raw = process.env.WWEBJS_WEB_VERSION?.trim();
   const lc = raw?.toLowerCase();
   if (raw && lc !== 'off' && lc !== 'latest' && lc !== 'auto') return { version: raw, source: 'pinned' };
-  if (lc === 'off') return { version: null, source: 'native' };
-  return { version: cachedCurrentVersion ?? null, source: 'auto' };
+  // Unset/auto/latest → resolved from registry (source reported as 'auto' when cached, 'native' otherwise).
+  if (cachedCurrentVersion) return { version: cachedCurrentVersion, source: 'auto' };
+  return { version: null, source: 'native' };
 }
